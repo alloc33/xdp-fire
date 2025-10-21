@@ -60,6 +60,87 @@ const ETH_P_IP: u16 = 0x0800; // IPv4 protocol
 const ETH_P_IPV6: u16 = 0x86dd; // IPv6 protocol
 const IPPROTO_TCP: u8 = 6; // TCP protocol
 
+// Helper: Parse IPv4 header and return (protocol, tcp_start_offset)
+#[inline(always)]
+fn parse_ipv4(ctx: &XdpContext, ip_start: usize, data_end: usize) -> Option<(u8, usize)> {
+	let ip_header_end = ip_start + mem::size_of::<Ipv4Header>();
+	if ip_header_end > data_end {
+		return None;
+	}
+
+	let ip = unsafe { *(ip_start as *const Ipv4Header) };
+	let src_ip = u32::from_be(ip.src_addr);
+	let dst_ip = u32::from_be(ip.dst_addr);
+	let src_bytes = src_ip.to_be_bytes();
+	let dst_bytes = dst_ip.to_be_bytes();
+
+	info!(
+		ctx,
+		"IPv4: {}.{}.{}.{} → {}.{}.{}.{}",
+		src_bytes[0],
+		src_bytes[1],
+		src_bytes[2],
+		src_bytes[3],
+		dst_bytes[0],
+		dst_bytes[1],
+		dst_bytes[2],
+		dst_bytes[3]
+	);
+
+	Some((ip.protocol, ip_header_end))
+}
+
+// Helper: Parse IPv6 header and return (next_header, tcp_start_offset)
+#[inline(always)]
+fn parse_ipv6(ctx: &XdpContext, ip_start: usize, data_end: usize) -> Option<(u8, usize)> {
+	let ip_header_end = ip_start + mem::size_of::<Ipv6Header>();
+	if ip_header_end > data_end {
+		return None;
+	}
+
+	let ip6 = unsafe { *(ip_start as *const Ipv6Header) };
+
+	info!(
+		ctx,
+		"IPv6: {:x}{:x}:{:x}{:x}:{:x}{:x}:{:x}{:x}... → {:x}{:x}:{:x}{:x}:{:x}{:x}:{:x}{:x}...",
+		ip6.src_addr[0],
+		ip6.src_addr[1],
+		ip6.src_addr[2],
+		ip6.src_addr[3],
+		ip6.src_addr[4],
+		ip6.src_addr[5],
+		ip6.src_addr[6],
+		ip6.src_addr[7],
+		ip6.dst_addr[0],
+		ip6.dst_addr[1],
+		ip6.dst_addr[2],
+		ip6.dst_addr[3],
+		ip6.dst_addr[4],
+		ip6.dst_addr[5],
+		ip6.dst_addr[6],
+		ip6.dst_addr[7]
+	);
+
+	Some((ip6.next_header, ip_header_end))
+}
+
+// Helper: Parse TCP header and return (src_port, dst_port)
+#[inline(always)]
+fn parse_tcp(ctx: &XdpContext, tcp_start: usize, data_end: usize) -> Option<(u16, u16)> {
+	let tcp_header_end = tcp_start + mem::size_of::<TcpHeader>();
+	if tcp_header_end > data_end {
+		return None;
+	}
+
+	let tcp = unsafe { *(tcp_start as *const TcpHeader) };
+	let src_port = u16::from_be(tcp.src_port);
+	let dst_port = u16::from_be(tcp.dst_port);
+
+	info!(ctx, "TCP: port {} → {}", src_port, dst_port);
+
+	Some((src_port, dst_port))
+}
+
 #[xdp]
 pub fn fractalize_ebpf(ctx: XdpContext) -> u32 {
 	match try_fractalize_ebpf(ctx) {
@@ -69,105 +150,37 @@ pub fn fractalize_ebpf(ctx: XdpContext) -> u32 {
 }
 
 fn try_fractalize_ebpf(ctx: XdpContext) -> Result<u32, u32> {
-	// Get packet data pointers
 	let data_start = ctx.data();
 	let data_end = ctx.data_end();
 
-	// Check if we have enough data for Ethernet header (14 bytes)
+	// Parse Ethernet header
 	let eth_header_end = data_start + mem::size_of::<EthernetHeader>();
 	if eth_header_end > data_end {
 		return Ok(xdp_action::XDP_PASS);
 	}
 
-	// Parse Ethernet header
 	let eth = unsafe { *(data_start as *const EthernetHeader) };
 	let ether_type = u16::from_be(eth.ether_type);
 
-	// Parse IP layer (both IPv4 and IPv6)
+	// Parse IP layer (IPv4 or IPv6) using helper functions
 	let ip_header_start = data_start + mem::size_of::<EthernetHeader>();
-	let (protocol, tcp_start) = match ether_type {
-		ETH_P_IP => {
-			// IPv4 packet
-			let ip_header_end = ip_header_start + mem::size_of::<Ipv4Header>();
-			if ip_header_end > data_end {
-				return Ok(xdp_action::XDP_PASS);
-			}
-
-			let ip = unsafe { *(ip_header_start as *const Ipv4Header) };
-			let src_ip = u32::from_be(ip.src_addr);
-			let dst_ip = u32::from_be(ip.dst_addr);
-			let src_bytes = src_ip.to_be_bytes();
-			let dst_bytes = dst_ip.to_be_bytes();
-
-			info!(
-				&ctx,
-				"IPv4: {}.{}.{}.{} → {}.{}.{}.{}",
-				src_bytes[0],
-				src_bytes[1],
-				src_bytes[2],
-				src_bytes[3],
-				dst_bytes[0],
-				dst_bytes[1],
-				dst_bytes[2],
-				dst_bytes[3]
-			);
-
-			(ip.protocol, ip_header_end)
-		},
-		ETH_P_IPV6 => {
-			// IPv6 packet
-			let ip_header_end = ip_header_start + mem::size_of::<Ipv6Header>();
-			if ip_header_end > data_end {
-				return Ok(xdp_action::XDP_PASS);
-			}
-
-			let ip6 = unsafe { *(ip_header_start as *const Ipv6Header) };
-
-			info!(
-				&ctx,
-				"IPv6: {:x}{:x}:{:x}{:x}:{:x}{:x}:{:x}{:x}... → {:x}{:x}:{:x}{:x}:{:x}{:x}:{:x}{:x}...",
-				ip6.src_addr[0],
-				ip6.src_addr[1],
-				ip6.src_addr[2],
-				ip6.src_addr[3],
-				ip6.src_addr[4],
-				ip6.src_addr[5],
-				ip6.src_addr[6],
-				ip6.src_addr[7],
-				ip6.dst_addr[0],
-				ip6.dst_addr[1],
-				ip6.dst_addr[2],
-				ip6.dst_addr[3],
-				ip6.dst_addr[4],
-				ip6.dst_addr[5],
-				ip6.dst_addr[6],
-				ip6.dst_addr[7]
-			);
-
-			(ip6.next_header, ip_header_end)
-		},
-		_ => {
-			// Not IP packet (ARP, etc.), pass through
-			return Ok(xdp_action::XDP_PASS);
-		},
+	let (protocol, tcp_start) = match match ether_type {
+		ETH_P_IP => parse_ipv4(&ctx, ip_header_start, data_end),
+		ETH_P_IPV6 => parse_ipv6(&ctx, ip_header_start, data_end),
+		_ => return Ok(xdp_action::XDP_PASS), // Not IP packet (ARP, etc.)
+	} {
+		Some(result) => result,
+		None => return Ok(xdp_action::XDP_PASS), // Parsing failed, pass packet through
 	};
 
-	// Parse TCP layer (same for both IPv4 and IPv6!)
+	// Parse TCP layer (if protocol is TCP)
 	if protocol == IPPROTO_TCP {
-		let tcp_header_end = tcp_start + mem::size_of::<TcpHeader>();
-		if tcp_header_end > data_end {
-			return Ok(xdp_action::XDP_PASS);
-		}
-
-		let tcp = unsafe { *(tcp_start as *const TcpHeader) };
-		let src_port = u16::from_be(tcp.src_port);
-		let dst_port = u16::from_be(tcp.dst_port);
-
-		info!(&ctx, "TCP: port {} → {}", src_port, dst_port);
-
-		// Check for Substrate P2P traffic (port 30333)
-		if dst_port == 30333 || src_port == 30333 {
-			info!(&ctx, "🔍 Substrate P2P traffic detected on port 30333!");
+		if let Some((src_port, dst_port)) = parse_tcp(&ctx, tcp_start, data_end) {
+			// Check for Substrate P2P traffic (port 30333)
+			if dst_port == 30333 || src_port == 30333 {
+				info!(&ctx, "🔍 Substrate P2P traffic detected on port 30333!");
+				// TODO: Add filtering logic here (XDP_DROP or XDP_PASS)
+			}
 		}
 	}
 
