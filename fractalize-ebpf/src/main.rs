@@ -2,7 +2,7 @@ use anyhow::Context as _;
 use aya::programs::{Xdp, XdpFlags};
 use clap::Parser;
 #[rustfmt::skip]
-use log::{debug, warn};
+use log::{debug, info, warn};
 use tokio::signal;
 
 #[derive(Debug, Parser)]
@@ -56,8 +56,21 @@ async fn main() -> anyhow::Result<()> {
     let Opt { iface } = opt;
     let program: &mut Xdp = ebpf.program_mut("fractalize_ebpf").unwrap().try_into()?;
     program.load()?;
-    program.attach(&iface, XdpFlags::default())
-        .context("failed to attach the XDP program with default flags - try changing XdpFlags::default() to XdpFlags::SKB_MODE")?;
+
+    // Try native XDP first (driver mode), fall back to generic/SKB mode if not supported
+    match program.attach(&iface, XdpFlags::DRV_MODE) {
+        Ok(_) => {
+            info!("✅ Attached XDP program in NATIVE mode (driver-level, best performance)");
+        }
+        Err(e) => {
+            warn!("⚠️  Native XDP not supported: {}", e);
+            info!("Falling back to GENERIC XDP mode (reduced performance)...");
+            program.attach(&iface, XdpFlags::SKB_MODE)
+                .context("Failed to attach XDP program even in generic/SKB mode")?;
+            warn!("⚠️  Running in GENERIC XDP mode - expect 5-10x slower performance");
+            warn!("⚠️  For production, use hardware with native XDP support (Intel i40e/ixgbe, Mellanox mlx5)");
+        }
+    }
 
     let ctrl_c = signal::ctrl_c();
     println!("Waiting for Ctrl-C...");
