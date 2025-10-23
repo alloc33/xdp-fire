@@ -27,6 +27,12 @@ const ACTION_LOG_ONLY: u8 = 2; // Monitor without filtering (future use)
 #[map]
 static PORT_RULES: HashMap<u16, u8> = HashMap::with_max_entries(100, 0);
 
+/// Per-port packet statistics (runtime readable from userspace)
+/// Key: port number (u16)
+/// Value: packet count (u64)
+#[map]
+static PORT_STATS: HashMap<u16, u64> = HashMap::with_max_entries(100, 0);
+
 // Statistics indices
 const STAT_TOTAL_PACKETS: u32 = 0;
 const STAT_TCP_PACKETS: u32 = 1;
@@ -52,6 +58,15 @@ fn inc_stat(index: u32) {
 	}
 }
 
+/// Increment packet counter for a specific port
+#[inline(always)]
+fn inc_port_stat(port: u16) {
+	unsafe {
+		let count = PORT_STATS.get(&port).copied().unwrap_or(0);
+		let _ = PORT_STATS.insert(&port, &(count + 1), 0);
+	}
+}
+
 /// Check if packet port has a filtering rule and apply it
 /// Returns Some(action) if rule exists, None if no rule (pass through)
 #[inline(always)]
@@ -64,6 +79,7 @@ fn check_port_rule(
 	// Check destination port first (more common for server ports)
 	if let Some(action) = unsafe { PORT_RULES.get(&dst_port) } {
 		inc_stat(STAT_SUBSTRATE_PACKETS);
+		inc_port_stat(dst_port);
 		info!(ctx, "🔍 Filtered port {} ({}) - dst", dst_port, proto_name);
 
 		match *action {
@@ -88,6 +104,7 @@ fn check_port_rule(
 	// Check source port (for responses from monitored services)
 	if let Some(action) = unsafe { PORT_RULES.get(&src_port) } {
 		inc_stat(STAT_SUBSTRATE_PACKETS);
+		inc_port_stat(src_port);
 		info!(ctx, "🔍 Filtered port {} ({}) - src", src_port, proto_name);
 
 		match *action {

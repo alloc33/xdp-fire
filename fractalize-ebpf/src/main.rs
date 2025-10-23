@@ -74,6 +74,13 @@ enum Commands {
 
 	/// List all configured port rules
 	ListRules,
+
+	/// Show per-port packet statistics
+	ShowStats {
+		/// Optional: show stats for specific port only
+		#[clap(short, long)]
+		port: Option<u16>,
+	},
 }
 
 const MAP_PIN_PATH: &str = "/sys/fs/bpf/fractalize-ebpf";
@@ -106,6 +113,42 @@ async fn handle_command(command: &Commands) -> anyhow::Result<()> {
 					let action_str =
 						Action::from_u8(action).map(|a| a.as_str()).unwrap_or("UNKNOWN");
 					info!("   Port {} -> {}", port, action_str);
+				}
+			}
+		},
+		Commands::ShowStats { port } => {
+			// Access the PORT_STATS map
+			let stats_map_path = Path::new(MAP_PIN_PATH).join("PORT_STATS");
+			let stats_map_data = MapData::from_pin(&stats_map_path)
+				.context("Failed to open pinned PORT_STATS map. Is the XDP program running?")?;
+
+			let mut stats_map = Map::from_map_data(stats_map_data)?;
+			let port_stats: HashMap<_, u16, u64> = HashMap::try_from(&mut stats_map)?;
+
+			if let Some(specific_port) = port {
+				// Show stats for specific port
+				match port_stats.get(specific_port, 0) {
+					Ok(count) => {
+						info!("📊 Port {} statistics: {} packets", specific_port, count);
+					},
+					Err(_) => {
+						info!("📊 Port {} statistics: 0 packets (no data yet)", specific_port);
+					},
+				}
+			} else {
+				// Show stats for all ports
+				info!("📊 Per-port packet statistics:");
+				let mut found_any = false;
+				for item in port_stats.iter() {
+					if let Ok((port, count)) = item {
+						if count > 0 {
+							info!("   Port {}: {} packets", port, count);
+							found_any = true;
+						}
+					}
+				}
+				if !found_any {
+					info!("   No packet statistics collected yet");
 				}
 			}
 		},
@@ -166,15 +209,20 @@ async fn main() -> anyhow::Result<()> {
 	// port_rules.insert(9944_u16, Action::LogOnly as u8, 0)?;  // Substrate RPC WebSocket
 	// port_rules.insert(9933_u16, Action::LogOnly as u8, 0)?;  // Substrate RPC HTTP
 
-	// Pin the map so it can be accessed by runtime configuration commands
+	// Pin the maps so they can be accessed by runtime configuration commands
 	use std::path::Path;
 	let map_pin_path = Path::new(MAP_PIN_PATH);
 	std::fs::create_dir_all(map_pin_path).ok(); // Create directory if it doesn't exist
 	port_rules.pin(map_pin_path.join("PORT_RULES"))?;
 
+	// Also pin PORT_STATS for statistics access
+	let port_stats: HashMap<_, u16, u64> = ebpf.map_mut("PORT_STATS").unwrap().try_into()?;
+	port_stats.pin(map_pin_path.join("PORT_STATS"))?;
+
 	info!("✅ Configured port filtering rules:");
 	info!("   Port 30333 (Substrate P2P): LOG_ONLY");
 	info!("📍 Pinned PORT_RULES map to {}/PORT_RULES", MAP_PIN_PATH);
+	info!("📍 Pinned PORT_STATS map to {}/PORT_STATS", MAP_PIN_PATH);
 
 	let Opt { iface, .. } = opt;
 	let program: &mut Xdp = ebpf.program_mut("fractalize_ebpf").unwrap().try_into()?;
