@@ -1,17 +1,111 @@
 #![no_std]
 #![no_main]
 
-use aya_ebpf::{bindings::xdp_action, macros::xdp, programs::XdpContext};
+use aya_ebpf::{
+	bindings::xdp_action,
+	macros::{map, xdp},
+	maps::{Array, HashMap},
+	programs::XdpContext,
+};
 use aya_log_ebpf::info;
 use core::mem;
 use network_types::{
 	eth::{EthHdr, EtherType},
 	ip::{IpProto, Ipv4Hdr, Ipv6Hdr},
 	tcp::TcpHdr,
+	udp::UdpHdr,
 };
 
-// Substrate P2P port
-const SUBSTRATE_PORT: u16 = 30333;
+// Port filtering actions
+const ACTION_PASS: u8 = 0;        // Allow traffic
+const ACTION_DROP: u8 = 1;        // Block traffic
+const ACTION_LOG_ONLY: u8 = 2;    // Monitor without filtering (future use)
+
+/// Port-based filtering rules (runtime configurable from userspace)
+/// Key: port number (u16)
+/// Value: action (u8) - 0=PASS, 1=DROP, 2=LOG_ONLY
+#[map]
+static PORT_RULES: HashMap<u16, u8> = HashMap::with_max_entries(100, 0);
+
+// Statistics indices
+const STAT_TOTAL_PACKETS: u32 = 0;
+const STAT_TCP_PACKETS: u32 = 1;
+const STAT_UDP_PACKETS: u32 = 2;
+const STAT_SUBSTRATE_PACKETS: u32 = 3;
+const STAT_NON_IP_PACKETS: u32 = 4;
+
+/// Packet statistics map
+/// - Index 0: Total packets processed
+/// - Index 1: TCP packets
+/// - Index 2: UDP packets
+/// - Index 3: Substrate P2P packets (port 30333, TCP or UDP)
+/// - Index 4: Non-IP packets (ARP, etc.)
+#[map]
+static STATS: Array<u64> = Array::with_max_entries(5, 0);
+
+/// Helper function to increment a statistic counter with zero overhead
+/// Uses get_ptr_mut for direct memory access without bounds checking in hot path
+#[inline(always)]
+fn inc_stat(index: u32) {
+	if let Some(counter) = STATS.get_ptr_mut(index) {
+		unsafe { *counter += 1 };
+	}
+}
+
+/// Check if packet port has a filtering rule and apply it
+/// Returns Some(action) if rule exists, None if no rule (pass through)
+#[inline(always)]
+fn check_port_rule(ctx: &XdpContext, src_port: u16, dst_port: u16, proto_name: &str) -> Option<u32> {
+	// Check destination port first (more common for server ports)
+	if let Some(action) = unsafe { PORT_RULES.get(&dst_port) } {
+		inc_stat(STAT_SUBSTRATE_PACKETS);
+		info!(ctx, "🔍 Filtered port {} ({}) - dst", dst_port, proto_name);
+
+		match *action {
+			ACTION_DROP => {
+				info!(ctx, "⛔ Dropping packet to port {}", dst_port);
+				return Some(xdp_action::XDP_DROP);
+			},
+			ACTION_PASS => {
+				info!(ctx, "✅ Allowing packet to port {}", dst_port);
+				return Some(xdp_action::XDP_PASS);
+			},
+			ACTION_LOG_ONLY => {
+				info!(ctx, "📝 Logging packet to port {} (pass through)", dst_port);
+				// Continue processing, don't return
+			},
+			_ => {
+				// Unknown action, pass through
+			},
+		}
+	}
+
+	// Check source port (for responses from monitored services)
+	if let Some(action) = unsafe { PORT_RULES.get(&src_port) } {
+		inc_stat(STAT_SUBSTRATE_PACKETS);
+		info!(ctx, "🔍 Filtered port {} ({}) - src", src_port, proto_name);
+
+		match *action {
+			ACTION_DROP => {
+				info!(ctx, "⛔ Dropping packet from port {}", src_port);
+				return Some(xdp_action::XDP_DROP);
+			},
+			ACTION_PASS => {
+				info!(ctx, "✅ Allowing packet from port {}", src_port);
+				return Some(xdp_action::XDP_PASS);
+			},
+			ACTION_LOG_ONLY => {
+				info!(ctx, "📝 Logging packet from port {} (pass through)", src_port);
+				// Continue processing, don't return
+			},
+			_ => {
+				// Unknown action, pass through
+			},
+		}
+	}
+
+	None
+}
 
 #[inline(always)]
 fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
@@ -35,6 +129,9 @@ pub fn fractalize_ebpf(ctx: XdpContext) -> u32 {
 }
 
 fn try_fractalize_ebpf(ctx: XdpContext) -> Result<u32, ()> {
+	// Count total packets processed
+	inc_stat(STAT_TOTAL_PACKETS);
+
 	// Parse Ethernet header - use offset_of! for efficiency (only validate the field we need)
 	let ether_type: *const EtherType = ptr_at(&ctx, mem::offset_of!(EthHdr, ether_type))?;
 
@@ -92,22 +189,44 @@ fn try_fractalize_ebpf(ctx: XdpContext) -> Result<u32, ()> {
 			let next_hdr = unsafe { (*ipv6hdr).next_hdr };
 			(next_hdr, EthHdr::LEN + Ipv6Hdr::LEN)
 		},
-		_ => return Ok(xdp_action::XDP_PASS), // Not IP packet (ARP, etc.)
+		_ => {
+			// Not IP packet (ARP, etc.)
+			inc_stat(STAT_NON_IP_PACKETS);
+			return Ok(xdp_action::XDP_PASS);
+		},
 	};
 
-	// Parse TCP layer using IpProto enum
-	if ip_proto == IpProto::Tcp {
-		let tcphdr: *const TcpHdr = ptr_at(&ctx, tcp_offset)?;
-		let src_port = unsafe { u16::from_be_bytes((*tcphdr).source) };
-		let dst_port = unsafe { u16::from_be_bytes((*tcphdr).dest) };
+	// Parse transport layer (TCP or UDP)
+	match ip_proto {
+		IpProto::Tcp => {
+			inc_stat(STAT_TCP_PACKETS);
+			let tcphdr: *const TcpHdr = ptr_at(&ctx, tcp_offset)?;
+			let src_port = unsafe { u16::from_be_bytes((*tcphdr).source) };
+			let dst_port = unsafe { u16::from_be_bytes((*tcphdr).dest) };
 
-		info!(&ctx, "TCP: port {} → {}", src_port, dst_port);
+			info!(&ctx, "TCP: port {} → {}", src_port, dst_port);
 
-		// Check for Substrate P2P traffic (port 30333)
-		if dst_port == SUBSTRATE_PORT || src_port == SUBSTRATE_PORT {
-			info!(&ctx, "🔍 Substrate P2P traffic detected on port 30333!");
-			// TODO: Add filtering logic here (XDP_DROP or XDP_PASS)
-		}
+			// Check for port-based filtering rules
+			if let Some(action) = check_port_rule(&ctx, src_port, dst_port, "TCP") {
+				return Ok(action);
+			}
+		},
+		IpProto::Udp => {
+			inc_stat(STAT_UDP_PACKETS);
+			let udphdr: *const UdpHdr = ptr_at(&ctx, tcp_offset)?;
+			let src_port = unsafe { u16::from_be_bytes((*udphdr).src) };
+			let dst_port = unsafe { u16::from_be_bytes((*udphdr).dst) };
+
+			info!(&ctx, "UDP: port {} → {}", src_port, dst_port);
+
+			// Check for port-based filtering rules
+			if let Some(action) = check_port_rule(&ctx, src_port, dst_port, "UDP/QUIC") {
+				return Ok(action);
+			}
+		},
+		_ => {
+			// Other protocols (ICMP, SCTP, etc.) - just pass through
+		},
 	}
 
 	Ok(xdp_action::XDP_PASS)

@@ -1,14 +1,96 @@
 use anyhow::Context as _;
-use aya::programs::{Xdp, XdpFlags};
-use clap::Parser;
+use aya::{
+	maps::{Array, HashMap, Map, MapData},
+	programs::{Xdp, XdpFlags},
+};
+use clap::{Parser, Subcommand};
 #[rustfmt::skip]
 use log::{debug, info, warn};
-use tokio::signal;
+use tokio::{
+	signal,
+	time::{Duration, sleep},
+};
 
 #[derive(Debug, Parser)]
+#[command(name = "fractalize-ebpf")]
+#[command(about = "XDP packet filter with runtime configuration")]
 struct Opt {
+	#[command(subcommand)]
+	command: Option<Commands>,
+
 	#[clap(short, long, default_value = "eth0")]
 	iface: String,
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+	/// Add a port filtering rule
+	AddRule {
+		/// Port number to filter
+		#[clap(short, long)]
+		port: u16,
+
+		/// Action: 0=PASS, 1=DROP, 2=LOG_ONLY
+		#[clap(short, long)]
+		action: u8,
+	},
+
+	/// Remove a port filtering rule
+	RemoveRule {
+		/// Port number to remove
+		#[clap(short, long)]
+		port: u16,
+	},
+
+	/// List all configured port rules
+	ListRules,
+}
+
+const MAP_PIN_PATH: &str = "/sys/fs/bpf/fractalize-ebpf";
+
+async fn handle_command(command: &Commands) -> anyhow::Result<()> {
+	use std::path::Path;
+
+	// Access the pinned map
+	let map_path = Path::new(MAP_PIN_PATH).join("PORT_RULES");
+	let map_data = MapData::from_pin(&map_path)
+		.context("Failed to open pinned PORT_RULES map. Is the XDP program running?")?;
+
+	let mut map = Map::from_map_data(map_data)?;
+	let mut port_rules: HashMap<_, u16, u8> = HashMap::try_from(&mut map)?;
+
+	match command {
+		Commands::AddRule { port, action } => {
+			port_rules.insert(*port, *action, 0)?;
+			let action_str = match *action {
+				0 => "PASS",
+				1 => "DROP",
+				2 => "LOG_ONLY",
+				_ => "UNKNOWN",
+			};
+			info!("✅ Added rule: Port {} -> {}", port, action_str);
+		}
+		Commands::RemoveRule { port } => {
+			port_rules.remove(port)?;
+			info!("✅ Removed rule for port {}", port);
+		}
+		Commands::ListRules => {
+			info!("📋 Configured port filtering rules:");
+			for item in port_rules.iter() {
+				if let Ok((port, action)) = item {
+					let action_str = match action {
+						0 => "PASS",
+						1 => "DROP",
+						2 => "LOG_ONLY",
+						_ => "UNKNOWN",
+					};
+					info!("   Port {} -> {}", port, action_str);
+				}
+			}
+		}
+	}
+
+	Ok(())
 }
 
 #[tokio::main]
@@ -16,6 +98,11 @@ async fn main() -> anyhow::Result<()> {
 	let opt = Opt::parse();
 
 	env_logger::init();
+
+	// Handle configuration subcommands
+	if let Some(command) = &opt.command {
+		return handle_command(command).await;
+	}
 
 	// Bump the memlock rlimit. This is needed for older kernels that don't use the
 	// new memcg based accounting, see https://lwn.net/Articles/837122/
@@ -48,7 +135,28 @@ async fn main() -> anyhow::Result<()> {
 			});
 		},
 	}
-	let Opt { iface } = opt;
+	// Configure port filtering rules before attaching
+	let mut port_rules: HashMap<_, u16, u8> = ebpf.map_mut("PORT_RULES").unwrap().try_into()?;
+
+	// Default configuration: Monitor Substrate P2P port (30333) without dropping
+	// Action codes: 0=PASS, 1=DROP, 2=LOG_ONLY
+	port_rules.insert(30333_u16, 2_u8, 0)?; // LOG_ONLY for Substrate P2P
+
+	// You can add more ports here:
+	// port_rules.insert(9944_u16, 2_u8, 0)?;  // Substrate RPC WebSocket
+	// port_rules.insert(9933_u16, 2_u8, 0)?;  // Substrate RPC HTTP
+
+	// Pin the map so it can be accessed by runtime configuration commands
+	use std::path::Path;
+	let map_pin_path = Path::new(MAP_PIN_PATH);
+	std::fs::create_dir_all(map_pin_path).ok(); // Create directory if it doesn't exist
+	port_rules.pin(map_pin_path.join("PORT_RULES"))?;
+
+	info!("✅ Configured port filtering rules:");
+	info!("   Port 30333 (Substrate P2P): LOG_ONLY");
+	info!("📍 Pinned PORT_RULES map to {}/PORT_RULES", MAP_PIN_PATH);
+
+	let Opt { iface, .. } = opt;
 	let program: &mut Xdp = ebpf.program_mut("fractalize_ebpf").unwrap().try_into()?;
 	program.load()?;
 
@@ -69,6 +177,29 @@ async fn main() -> anyhow::Result<()> {
 			);
 		},
 	}
+
+	// Get reference to statistics map
+	let stats_map: Array<_, u64> = ebpf.take_map("STATS").unwrap().try_into()?;
+
+	// Spawn background task to display statistics every second
+	tokio::task::spawn(async move {
+		loop {
+			sleep(Duration::from_secs(1)).await;
+
+			// Read statistics from eBPF map
+			let total = stats_map.get(&0, 0).unwrap_or(0);
+			let tcp = stats_map.get(&1, 0).unwrap_or(0);
+			let udp = stats_map.get(&2, 0).unwrap_or(0);
+			let substrate = stats_map.get(&3, 0).unwrap_or(0);
+			let non_ip = stats_map.get(&4, 0).unwrap_or(0);
+
+			// Display statistics
+			info!(
+				"📊 Stats: Total={} TCP={} UDP={} Substrate={} Non-IP={}",
+				total, tcp, udp, substrate, non_ip
+			);
+		}
+	});
 
 	let ctrl_c = signal::ctrl_c();
 	println!("Waiting for Ctrl-C...");
