@@ -4,6 +4,7 @@ use aya::{
 	programs::{Xdp, XdpFlags},
 };
 use clap::{Parser, Subcommand};
+use fractalize_ebpf_common::actions::*;
 #[rustfmt::skip]
 use log::{debug, info, warn};
 use tokio::{
@@ -11,13 +12,13 @@ use tokio::{
 	time::{Duration, sleep},
 };
 
-/// Port filtering actions (must match kernel-side constants)
+/// Port filtering actions (uses shared constants from fractalize-ebpf-common)
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, PartialEq)]
 enum Action {
-	Pass = 0,
-	Drop = 1,
-	LogOnly = 2,
+	Pass = ACTION_PASS,
+	Drop = ACTION_DROP,
+	LogOnly = ACTION_LOG_ONLY,
 }
 
 impl Action {
@@ -33,9 +34,9 @@ impl Action {
 	/// Convert u8 to Action
 	fn from_u8(val: u8) -> Option<Self> {
 		match val {
-			0 => Some(Action::Pass),
-			1 => Some(Action::Drop),
-			2 => Some(Action::LogOnly),
+			ACTION_PASS => Some(Action::Pass),
+			ACTION_DROP => Some(Action::Drop),
+			ACTION_LOG_ONLY => Some(Action::LogOnly),
 			_ => None,
 		}
 	}

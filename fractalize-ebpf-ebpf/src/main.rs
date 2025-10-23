@@ -9,17 +9,13 @@ use aya_ebpf::{
 };
 use aya_log_ebpf::info;
 use core::mem;
+use fractalize_ebpf_common::actions::*;
 use network_types::{
 	eth::{EthHdr, EtherType},
 	ip::{IpProto, Ipv4Hdr, Ipv6Hdr},
 	tcp::TcpHdr,
 	udp::UdpHdr,
 };
-
-// Port filtering actions
-const ACTION_PASS: u8 = 0; // Allow traffic
-const ACTION_DROP: u8 = 1; // Block traffic
-const ACTION_LOG_ONLY: u8 = 2; // Monitor without filtering (future use)
 
 /// Port-based filtering rules (runtime configurable from userspace)
 /// Key: port number (u16)
