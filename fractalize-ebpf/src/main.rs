@@ -11,6 +11,36 @@ use tokio::{
 	time::{Duration, sleep},
 };
 
+/// Port filtering actions (must match kernel-side constants)
+#[repr(u8)]
+#[derive(Debug, Copy, Clone, PartialEq)]
+enum Action {
+	Pass = 0,
+	Drop = 1,
+	LogOnly = 2,
+}
+
+impl Action {
+	/// Convert action to human-readable string
+	fn as_str(&self) -> &'static str {
+		match self {
+			Action::Pass => "PASS",
+			Action::Drop => "DROP",
+			Action::LogOnly => "LOG_ONLY",
+		}
+	}
+
+	/// Convert u8 to Action
+	fn from_u8(val: u8) -> Option<Self> {
+		match val {
+			0 => Some(Action::Pass),
+			1 => Some(Action::Drop),
+			2 => Some(Action::LogOnly),
+			_ => None,
+		}
+	}
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "fractalize-ebpf")]
 #[command(about = "XDP packet filter with runtime configuration")]
@@ -30,7 +60,7 @@ enum Commands {
 		#[clap(short, long)]
 		port: u16,
 
-		/// Action: 0=PASS, 1=DROP, 2=LOG_ONLY
+		/// Action code: 0=PASS, 1=DROP, 2=LOG_ONLY
 		#[clap(short, long)]
 		action: u8,
 	},
@@ -62,32 +92,23 @@ async fn handle_command(command: &Commands) -> anyhow::Result<()> {
 	match command {
 		Commands::AddRule { port, action } => {
 			port_rules.insert(*port, *action, 0)?;
-			let action_str = match *action {
-				0 => "PASS",
-				1 => "DROP",
-				2 => "LOG_ONLY",
-				_ => "UNKNOWN",
-			};
+			let action_str = Action::from_u8(*action).map(|a| a.as_str()).unwrap_or("UNKNOWN");
 			info!("✅ Added rule: Port {} -> {}", port, action_str);
-		}
+		},
 		Commands::RemoveRule { port } => {
 			port_rules.remove(port)?;
 			info!("✅ Removed rule for port {}", port);
-		}
+		},
 		Commands::ListRules => {
 			info!("📋 Configured port filtering rules:");
 			for item in port_rules.iter() {
 				if let Ok((port, action)) = item {
-					let action_str = match action {
-						0 => "PASS",
-						1 => "DROP",
-						2 => "LOG_ONLY",
-						_ => "UNKNOWN",
-					};
+					let action_str =
+						Action::from_u8(action).map(|a| a.as_str()).unwrap_or("UNKNOWN");
 					info!("   Port {} -> {}", port, action_str);
 				}
 			}
-		}
+		},
 	}
 
 	Ok(())
@@ -139,12 +160,11 @@ async fn main() -> anyhow::Result<()> {
 	let mut port_rules: HashMap<_, u16, u8> = ebpf.map_mut("PORT_RULES").unwrap().try_into()?;
 
 	// Default configuration: Monitor Substrate P2P port (30333) without dropping
-	// Action codes: 0=PASS, 1=DROP, 2=LOG_ONLY
-	port_rules.insert(30333_u16, 2_u8, 0)?; // LOG_ONLY for Substrate P2P
+	port_rules.insert(30333_u16, Action::LogOnly as u8, 0)?;
 
 	// You can add more ports here:
-	// port_rules.insert(9944_u16, 2_u8, 0)?;  // Substrate RPC WebSocket
-	// port_rules.insert(9933_u16, 2_u8, 0)?;  // Substrate RPC HTTP
+	// port_rules.insert(9944_u16, Action::LogOnly as u8, 0)?;  // Substrate RPC WebSocket
+	// port_rules.insert(9933_u16, Action::LogOnly as u8, 0)?;  // Substrate RPC HTTP
 
 	// Pin the map so it can be accessed by runtime configuration commands
 	use std::path::Path;

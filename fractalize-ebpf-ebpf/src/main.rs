@@ -17,9 +17,9 @@ use network_types::{
 };
 
 // Port filtering actions
-const ACTION_PASS: u8 = 0;        // Allow traffic
-const ACTION_DROP: u8 = 1;        // Block traffic
-const ACTION_LOG_ONLY: u8 = 2;    // Monitor without filtering (future use)
+const ACTION_PASS: u8 = 0; // Allow traffic
+const ACTION_DROP: u8 = 1; // Block traffic
+const ACTION_LOG_ONLY: u8 = 2; // Monitor without filtering (future use)
 
 /// Port-based filtering rules (runtime configurable from userspace)
 /// Key: port number (u16)
@@ -55,7 +55,12 @@ fn inc_stat(index: u32) {
 /// Check if packet port has a filtering rule and apply it
 /// Returns Some(action) if rule exists, None if no rule (pass through)
 #[inline(always)]
-fn check_port_rule(ctx: &XdpContext, src_port: u16, dst_port: u16, proto_name: &str) -> Option<u32> {
+fn check_port_rule(
+	ctx: &XdpContext,
+	src_port: u16,
+	dst_port: u16,
+	proto_name: &str,
+) -> Option<u32> {
 	// Check destination port first (more common for server ports)
 	if let Some(action) = unsafe { PORT_RULES.get(&dst_port) } {
 		inc_stat(STAT_SUBSTRATE_PACKETS);
