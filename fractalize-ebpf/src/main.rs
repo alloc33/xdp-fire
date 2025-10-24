@@ -5,9 +5,10 @@ use aya::{
 };
 use clap::{Parser, Subcommand};
 use core::convert::TryFrom;
-use fractalize_ebpf_common::{actions::*, logging::*};
+use fractalize_ebpf_common::{actions::*, ip_filter::*, logging::*};
 #[rustfmt::skip]
 use log::{debug, info, warn};
+use std::net::Ipv4Addr;
 use tokio::{
 	signal,
 	time::{Duration, sleep},
@@ -63,6 +64,50 @@ enum Commands {
 
 	/// Get current log level
 	GetLogLevel,
+
+	/// Set IP filter mode (0=DISABLED, 1=BLOCKLIST, 2=ALLOWLIST)
+	SetIpFilterMode {
+		/// Filter mode: 0=DISABLED, 1=BLOCKLIST, 2=ALLOWLIST
+		#[clap(short, long)]
+		mode: u8,
+	},
+
+	/// Get current IP filter mode
+	GetIpFilterMode,
+
+	/// Add IP to filter list
+	AddIp {
+		/// IPv4 address (e.g., 192.168.1.100)
+		#[clap(short, long)]
+		ip: Ipv4Addr,
+	},
+
+	/// Remove IP from filter list
+	RemoveIp {
+		/// IPv4 address (e.g., 192.168.1.100)
+		#[clap(short, long)]
+		ip: Ipv4Addr,
+	},
+
+	/// List all IPs in filter list
+	ListIps,
+
+	/// Enable rate limiting
+	EnableRateLimit {
+		/// Packets per second limit
+		#[clap(short, long)]
+		pps: u32,
+
+		/// Time window in milliseconds (default: 1000ms = 1 second)
+		#[clap(short, long, default_value = "1000")]
+		window_ms: u32,
+	},
+
+	/// Disable rate limiting
+	DisableRateLimit,
+
+	/// Get rate limit configuration
+	GetRateLimit,
 }
 
 const MAP_PIN_PATH: &str = "/sys/fs/bpf/fractalize-ebpf";
@@ -78,10 +123,11 @@ async fn handle_command(command: &Commands) -> anyhow::Result<()> {
 				.context("Failed to open pinned CONFIG map. Is the XDP program running?")?;
 
 			let mut config_map = Map::from_map_data(config_data)?;
-			let mut config: Array<_, u8> = Array::try_from(&mut config_map)?;
+			let mut config: Array<_, u32> = Array::try_from(&mut config_map)?;
 
-			config.set(CONFIG_LOG_LEVEL, *level, 0)?;
-			let level_str = LogLevel::try_from(*level).ok().map(|l| l.as_str()).unwrap_or("UNKNOWN");
+			config.set(CONFIG_LOG_LEVEL, *level as u32, 0)?;
+			let level_str =
+				LogLevel::try_from(*level).ok().map(|l| l.as_str()).unwrap_or("UNKNOWN");
 			info!("✅ Set log level to: {}", level_str);
 		},
 		Commands::GetLogLevel => {
@@ -91,15 +137,143 @@ async fn handle_command(command: &Commands) -> anyhow::Result<()> {
 				.context("Failed to open pinned CONFIG map. Is the XDP program running?")?;
 
 			let mut config_map = Map::from_map_data(config_data)?;
-			let config: Array<_, u8> = Array::try_from(&mut config_map)?;
+			let config: Array<_, u32> = Array::try_from(&mut config_map)?;
 
 			match config.get(&CONFIG_LOG_LEVEL, 0) {
 				Ok(level) => {
-					let level_str = LogLevel::try_from(level).ok().map(|l| l.as_str()).unwrap_or("UNKNOWN");
+					let level_str = LogLevel::try_from(level as u8)
+						.ok()
+						.map(|l| l.as_str())
+						.unwrap_or("UNKNOWN");
 					info!("📋 Current log level: {} ({})", level_str, level);
 				},
 				Err(_) => {
 					info!("📋 Log level not set (default: FILTERED)");
+				},
+			}
+		},
+		Commands::SetIpFilterMode { mode } => {
+			let config_path = Path::new(MAP_PIN_PATH).join("CONFIG");
+			let config_data = MapData::from_pin(&config_path)
+				.context("Failed to open pinned CONFIG map. Is the XDP program running?")?;
+
+			let mut config_map = Map::from_map_data(config_data)?;
+			let mut config: Array<_, u32> = Array::try_from(&mut config_map)?;
+
+			config.set(CONFIG_IP_FILTER_MODE, *mode as u32, 0)?;
+			let mode_str =
+				IpFilterMode::try_from(*mode).ok().map(|m| m.as_str()).unwrap_or("UNKNOWN");
+			info!("✅ Set IP filter mode to: {}", mode_str);
+		},
+		Commands::GetIpFilterMode => {
+			let config_path = Path::new(MAP_PIN_PATH).join("CONFIG");
+			let config_data = MapData::from_pin(&config_path)
+				.context("Failed to open pinned CONFIG map. Is the XDP program running?")?;
+
+			let mut config_map = Map::from_map_data(config_data)?;
+			let config: Array<_, u32> = Array::try_from(&mut config_map)?;
+
+			match config.get(&CONFIG_IP_FILTER_MODE, 0) {
+				Ok(mode) => {
+					let mode_str = IpFilterMode::try_from(mode as u8)
+						.ok()
+						.map(|m| m.as_str())
+						.unwrap_or("UNKNOWN");
+					info!("📋 Current IP filter mode: {} ({})", mode_str, mode);
+				},
+				Err(_) => {
+					info!("📋 IP filter mode not set (default: DISABLED)");
+				},
+			}
+		},
+		Commands::AddIp { ip } => {
+			let ip_list_path = Path::new(MAP_PIN_PATH).join("IP_FILTER_LIST");
+			let ip_list_data = MapData::from_pin(&ip_list_path)
+				.context("Failed to open pinned IP_FILTER_LIST map. Is the XDP program running?")?;
+
+			let mut ip_list_map = Map::from_map_data(ip_list_data)?;
+			let mut ip_list: HashMap<_, u32, u8> = HashMap::try_from(&mut ip_list_map)?;
+
+			let ip_u32 = u32::from(*ip);
+			ip_list.insert(ip_u32, 1, 0)?;
+			info!("✅ Added IP to filter list: {}", ip);
+		},
+		Commands::RemoveIp { ip } => {
+			let ip_list_path = Path::new(MAP_PIN_PATH).join("IP_FILTER_LIST");
+			let ip_list_data = MapData::from_pin(&ip_list_path)
+				.context("Failed to open pinned IP_FILTER_LIST map. Is the XDP program running?")?;
+
+			let mut ip_list_map = Map::from_map_data(ip_list_data)?;
+			let mut ip_list: HashMap<_, u32, u8> = HashMap::try_from(&mut ip_list_map)?;
+
+			let ip_u32 = u32::from(*ip);
+			ip_list.remove(&ip_u32)?;
+			info!("✅ Removed IP from filter list: {}", ip);
+		},
+		Commands::ListIps => {
+			let ip_list_path = Path::new(MAP_PIN_PATH).join("IP_FILTER_LIST");
+			let ip_list_data = MapData::from_pin(&ip_list_path)
+				.context("Failed to open pinned IP_FILTER_LIST map. Is the XDP program running?")?;
+
+			let mut ip_list_map = Map::from_map_data(ip_list_data)?;
+			let ip_list: HashMap<_, u32, u8> = HashMap::try_from(&mut ip_list_map)?;
+
+			info!("📋 IP filter list:");
+			let mut found_any = false;
+			for item in ip_list.iter() {
+				if let Ok((ip_u32, _)) = item {
+					let ip = Ipv4Addr::from(ip_u32);
+					info!("   {}", ip);
+					found_any = true;
+				}
+			}
+			if !found_any {
+				info!("   (empty)");
+			}
+		},
+		Commands::EnableRateLimit { pps, window_ms } => {
+			let config_path = Path::new(MAP_PIN_PATH).join("CONFIG");
+			let config_data = MapData::from_pin(&config_path)
+				.context("Failed to open pinned CONFIG map. Is the XDP program running?")?;
+
+			let mut config_map = Map::from_map_data(config_data)?;
+			let mut config: Array<_, u32> = Array::try_from(&mut config_map)?;
+
+			// Enable rate limiting
+			config.set(CONFIG_RATE_LIMIT_ENABLED, 1, 0)?;
+			config.set(CONFIG_RATE_LIMIT_PPS, *pps, 0)?;
+			config.set(CONFIG_RATE_LIMIT_WINDOW_MS, *window_ms, 0)?;
+
+			info!("✅ Enabled rate limiting: {} packets per {} ms", pps, window_ms);
+		},
+		Commands::DisableRateLimit => {
+			let config_path = Path::new(MAP_PIN_PATH).join("CONFIG");
+			let config_data = MapData::from_pin(&config_path)
+				.context("Failed to open pinned CONFIG map. Is the XDP program running?")?;
+
+			let mut config_map = Map::from_map_data(config_data)?;
+			let mut config: Array<_, u32> = Array::try_from(&mut config_map)?;
+
+			config.set(CONFIG_RATE_LIMIT_ENABLED, 0, 0)?;
+			info!("✅ Disabled rate limiting");
+		},
+		Commands::GetRateLimit => {
+			let config_path = Path::new(MAP_PIN_PATH).join("CONFIG");
+			let config_data = MapData::from_pin(&config_path)
+				.context("Failed to open pinned CONFIG map. Is the XDP program running?")?;
+
+			let mut config_map = Map::from_map_data(config_data)?;
+			let config: Array<_, u32> = Array::try_from(&mut config_map)?;
+
+			match config.get(&CONFIG_RATE_LIMIT_ENABLED, 0) {
+				Ok(enabled) if enabled != 0 => {
+					let pps = config.get(&CONFIG_RATE_LIMIT_PPS, 0).unwrap_or(0);
+					let window_ms = config.get(&CONFIG_RATE_LIMIT_WINDOW_MS, 0).unwrap_or(0);
+					info!("📋 Rate limiting: ENABLED");
+					info!("   Limit: {} packets per {} ms", pps, window_ms);
+				},
+				_ => {
+					info!("📋 Rate limiting: DISABLED");
 				},
 			}
 		},
@@ -113,61 +287,68 @@ async fn handle_command(command: &Commands) -> anyhow::Result<()> {
 			let mut port_rules: HashMap<_, u16, u8> = HashMap::try_from(&mut map)?;
 
 			match command {
-		Commands::AddRule { port, action } => {
-			port_rules.insert(*port, *action, 0)?;
-			let action_str = Action::try_from(*action).ok().map(|a| a.as_str()).unwrap_or("UNKNOWN");
-			info!("✅ Added rule: Port {} -> {}", port, action_str);
-		},
-		Commands::RemoveRule { port } => {
-			port_rules.remove(port)?;
-			info!("✅ Removed rule for port {}", port);
-		},
-		Commands::ListRules => {
-			info!("📋 Configured port filtering rules:");
-			for item in port_rules.iter() {
-				if let Ok((port, action)) = item {
+				Commands::AddRule { port, action } => {
+					port_rules.insert(*port, *action, 0)?;
 					let action_str =
-						Action::try_from(action).ok().map(|a| a.as_str()).unwrap_or("UNKNOWN");
-					info!("   Port {} -> {}", port, action_str);
-				}
-			}
-		},
-		Commands::ShowStats { port } => {
-			// Access the PORT_STATS map
-			let stats_map_path = Path::new(MAP_PIN_PATH).join("PORT_STATS");
-			let stats_map_data = MapData::from_pin(&stats_map_path)
-				.context("Failed to open pinned PORT_STATS map. Is the XDP program running?")?;
-
-			let mut stats_map = Map::from_map_data(stats_map_data)?;
-			let port_stats: HashMap<_, u16, u64> = HashMap::try_from(&mut stats_map)?;
-
-			if let Some(specific_port) = port {
-				// Show stats for specific port
-				match port_stats.get(specific_port, 0) {
-					Ok(count) => {
-						info!("📊 Port {} statistics: {} packets", specific_port, count);
-					},
-					Err(_) => {
-						info!("📊 Port {} statistics: 0 packets (no data yet)", specific_port);
-					},
-				}
-			} else {
-				// Show stats for all ports
-				info!("📊 Per-port packet statistics:");
-				let mut found_any = false;
-				for item in port_stats.iter() {
-					if let Ok((port, count)) = item {
-						if count > 0 {
-							info!("   Port {}: {} packets", port, count);
-							found_any = true;
+						Action::try_from(*action).ok().map(|a| a.as_str()).unwrap_or("UNKNOWN");
+					info!("✅ Added rule: Port {} -> {}", port, action_str);
+				},
+				Commands::RemoveRule { port } => {
+					port_rules.remove(port)?;
+					info!("✅ Removed rule for port {}", port);
+				},
+				Commands::ListRules => {
+					info!("📋 Configured port filtering rules:");
+					for item in port_rules.iter() {
+						if let Ok((port, action)) = item {
+							let action_str = Action::try_from(action)
+								.ok()
+								.map(|a| a.as_str())
+								.unwrap_or("UNKNOWN");
+							info!("   Port {} -> {}", port, action_str);
 						}
 					}
-				}
-				if !found_any {
-					info!("   No packet statistics collected yet");
-				}
-			}
-		},
+				},
+				Commands::ShowStats { port } => {
+					// Access the PORT_STATS map
+					let stats_map_path = Path::new(MAP_PIN_PATH).join("PORT_STATS");
+					let stats_map_data = MapData::from_pin(&stats_map_path).context(
+						"Failed to open pinned PORT_STATS map. Is the XDP program running?",
+					)?;
+
+					let mut stats_map = Map::from_map_data(stats_map_data)?;
+					let port_stats: HashMap<_, u16, u64> = HashMap::try_from(&mut stats_map)?;
+
+					if let Some(specific_port) = port {
+						// Show stats for specific port
+						match port_stats.get(specific_port, 0) {
+							Ok(count) => {
+								info!("📊 Port {} statistics: {} packets", specific_port, count);
+							},
+							Err(_) => {
+								info!(
+									"📊 Port {} statistics: 0 packets (no data yet)",
+									specific_port
+								);
+							},
+						}
+					} else {
+						// Show stats for all ports
+						info!("📊 Per-port packet statistics:");
+						let mut found_any = false;
+						for item in port_stats.iter() {
+							if let Ok((port, count)) = item {
+								if count > 0 {
+									info!("   Port {}: {} packets", port, count);
+									found_any = true;
+								}
+							}
+						}
+						if !found_any {
+							info!("   No packet statistics collected yet");
+						}
+					}
+				},
 				_ => unreachable!(),
 			}
 		},
@@ -238,16 +419,34 @@ async fn main() -> anyhow::Result<()> {
 	let port_stats: HashMap<_, u16, u64> = ebpf.map_mut("PORT_STATS").unwrap().try_into()?;
 	port_stats.pin(map_pin_path.join("PORT_STATS"))?;
 
-	// Pin CONFIG map for runtime log level control
-	let mut config: Array<_, u8> = ebpf.map_mut("CONFIG").unwrap().try_into()?;
-	config.set(CONFIG_LOG_LEVEL, LogLevel::Filtered as u8, 0)?; // Default to Filtered mode
+	// Pin CONFIG map for runtime log level, IP filter, and rate limit control
+	let mut config: Array<_, u32> = ebpf.map_mut("CONFIG").unwrap().try_into()?;
+	config.set(CONFIG_LOG_LEVEL, LogLevel::Filtered as u32, 0)?; // Default to Filtered mode
+	config.set(CONFIG_IP_FILTER_MODE, IpFilterMode::Disabled as u32, 0)?; // Default to Disabled
+	config.set(CONFIG_RATE_LIMIT_ENABLED, 0, 0)?; // Default to Disabled
+	config.set(CONFIG_RATE_LIMIT_PPS, 1000, 0)?; // Default: 1000 packets per window
+	config.set(CONFIG_RATE_LIMIT_WINDOW_MS, 1000, 0)?; // Default: 1000ms window (1000 pps)
 	config.pin(map_pin_path.join("CONFIG"))?;
+
+	// Pin IP_FILTER_LIST map for runtime IP filtering
+	let ip_filter_list: HashMap<_, u32, u8> = ebpf.map_mut("IP_FILTER_LIST").unwrap().try_into()?;
+	ip_filter_list.pin(map_pin_path.join("IP_FILTER_LIST"))?;
+
+	// Pin RATE_LIMIT_STATE map for per-IP rate limiting
+	let rate_limit_state: HashMap<_, u32, u64> =
+		ebpf.map_mut("RATE_LIMIT_STATE").unwrap().try_into()?;
+	rate_limit_state.pin(map_pin_path.join("RATE_LIMIT_STATE"))?;
 
 	info!("✅ Configured port filtering rules:");
 	info!("   Port 30333 (Substrate P2P): LOG_ONLY");
 	info!("📍 Pinned PORT_RULES map to {}/PORT_RULES", MAP_PIN_PATH);
 	info!("📍 Pinned PORT_STATS map to {}/PORT_STATS", MAP_PIN_PATH);
-	info!("📍 Pinned CONFIG map to {}/CONFIG (log level: FILTERED)", MAP_PIN_PATH);
+	info!(
+		"📍 Pinned CONFIG map to {}/CONFIG (log: FILTERED, IP filter: DISABLED, rate limit: DISABLED)",
+		MAP_PIN_PATH
+	);
+	info!("📍 Pinned IP_FILTER_LIST map to {}/IP_FILTER_LIST", MAP_PIN_PATH);
+	info!("📍 Pinned RATE_LIMIT_STATE map to {}/RATE_LIMIT_STATE", MAP_PIN_PATH);
 
 	let Opt { iface, .. } = opt;
 	let program: &mut Xdp = ebpf.program_mut("fractalize_ebpf").unwrap().try_into()?;
