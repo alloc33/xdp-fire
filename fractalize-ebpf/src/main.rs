@@ -12,36 +12,6 @@ use tokio::{
 	time::{Duration, sleep},
 };
 
-/// Port filtering actions (uses shared constants from fractalize-ebpf-common)
-#[repr(u8)]
-#[derive(Debug, Copy, Clone, PartialEq)]
-enum Action {
-	Pass = ACTION_PASS,
-	Drop = ACTION_DROP,
-	LogOnly = ACTION_LOG_ONLY,
-}
-
-impl Action {
-	/// Convert action to human-readable string
-	fn as_str(&self) -> &'static str {
-		match self {
-			Action::Pass => "PASS",
-			Action::Drop => "DROP",
-			Action::LogOnly => "LOG_ONLY",
-		}
-	}
-
-	/// Convert u8 to Action
-	fn from_u8(val: u8) -> Option<Self> {
-		match val {
-			ACTION_PASS => Some(Action::Pass),
-			ACTION_DROP => Some(Action::Drop),
-			ACTION_LOG_ONLY => Some(Action::LogOnly),
-			_ => None,
-		}
-	}
-}
-
 #[derive(Debug, Parser)]
 #[command(name = "fractalize-ebpf")]
 #[command(about = "XDP packet filter with runtime configuration")]
@@ -100,7 +70,7 @@ async fn handle_command(command: &Commands) -> anyhow::Result<()> {
 	match command {
 		Commands::AddRule { port, action } => {
 			port_rules.insert(*port, *action, 0)?;
-			let action_str = Action::from_u8(*action).map(|a| a.as_str()).unwrap_or("UNKNOWN");
+			let action_str = Action::try_from(*action).ok().map(|a| a.as_str()).unwrap_or("UNKNOWN");
 			info!("✅ Added rule: Port {} -> {}", port, action_str);
 		},
 		Commands::RemoveRule { port } => {
@@ -112,7 +82,7 @@ async fn handle_command(command: &Commands) -> anyhow::Result<()> {
 			for item in port_rules.iter() {
 				if let Ok((port, action)) = item {
 					let action_str =
-						Action::from_u8(action).map(|a| a.as_str()).unwrap_or("UNKNOWN");
+						Action::try_from(action).ok().map(|a| a.as_str()).unwrap_or("UNKNOWN");
 					info!("   Port {} -> {}", port, action_str);
 				}
 			}

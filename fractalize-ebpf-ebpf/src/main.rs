@@ -8,6 +8,7 @@ use aya_ebpf::{
 	programs::XdpContext,
 };
 use aya_log_ebpf::info;
+use core::convert::TryFrom;
 use core::mem;
 use fractalize_ebpf_common::actions::*;
 use network_types::{
@@ -19,7 +20,7 @@ use network_types::{
 
 /// Port-based filtering rules (runtime configurable from userspace)
 /// Key: port number (u16)
-/// Value: action (u8) - 0=PASS, 1=DROP, 2=LOG_ONLY
+/// Value: action (u8) - see Action enum (0=Pass, 1=Drop, 2=LogOnly)
 #[map]
 static PORT_RULES: HashMap<u16, u8> = HashMap::with_max_entries(100, 0);
 
@@ -73,50 +74,50 @@ fn check_port_rule(
 	proto_name: &str,
 ) -> Option<u32> {
 	// Check destination port first (more common for server ports)
-	if let Some(action) = unsafe { PORT_RULES.get(&dst_port) } {
+	if let Some(action_code) = unsafe { PORT_RULES.get(&dst_port) } {
 		inc_stat(STAT_SUBSTRATE_PACKETS);
 		inc_port_stat(dst_port);
 		info!(ctx, "🔍 Filtered port {} ({}) - dst", dst_port, proto_name);
 
-		match *action {
-			ACTION_DROP => {
+		match Action::try_from(*action_code) {
+			Ok(Action::Drop) => {
 				info!(ctx, "⛔ Dropping packet to port {}", dst_port);
 				return Some(xdp_action::XDP_DROP);
 			},
-			ACTION_PASS => {
+			Ok(Action::Pass) => {
 				info!(ctx, "✅ Allowing packet to port {}", dst_port);
 				return Some(xdp_action::XDP_PASS);
 			},
-			ACTION_LOG_ONLY => {
+			Ok(Action::LogOnly) => {
 				info!(ctx, "📝 Logging packet to port {} (pass through)", dst_port);
 				// Continue processing, don't return
 			},
-			_ => {
+			Err(_) => {
 				// Unknown action, pass through
 			},
 		}
 	}
 
 	// Check source port (for responses from monitored services)
-	if let Some(action) = unsafe { PORT_RULES.get(&src_port) } {
+	if let Some(action_code) = unsafe { PORT_RULES.get(&src_port) } {
 		inc_stat(STAT_SUBSTRATE_PACKETS);
 		inc_port_stat(src_port);
 		info!(ctx, "🔍 Filtered port {} ({}) - src", src_port, proto_name);
 
-		match *action {
-			ACTION_DROP => {
+		match Action::try_from(*action_code) {
+			Ok(Action::Drop) => {
 				info!(ctx, "⛔ Dropping packet from port {}", src_port);
 				return Some(xdp_action::XDP_DROP);
 			},
-			ACTION_PASS => {
+			Ok(Action::Pass) => {
 				info!(ctx, "✅ Allowing packet from port {}", src_port);
 				return Some(xdp_action::XDP_PASS);
 			},
-			ACTION_LOG_ONLY => {
+			Ok(Action::LogOnly) => {
 				info!(ctx, "📝 Logging packet from port {} (pass through)", src_port);
 				// Continue processing, don't return
 			},
-			_ => {
+			Err(_) => {
 				// Unknown action, pass through
 			},
 		}
