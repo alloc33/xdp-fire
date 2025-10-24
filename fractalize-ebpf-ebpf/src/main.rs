@@ -10,7 +10,7 @@ use aya_ebpf::{
 use aya_log_ebpf::info;
 use core::convert::TryFrom;
 use core::mem;
-use fractalize_ebpf_common::actions::*;
+use fractalize_ebpf_common::{actions::*, logging::*};
 use network_types::{
 	eth::{EthHdr, EtherType},
 	ip::{IpProto, Ipv4Hdr, Ipv6Hdr},
@@ -46,6 +46,20 @@ const STAT_NON_IP_PACKETS: u32 = 4;
 #[map]
 static STATS: Array<u64> = Array::with_max_entries(5, 0);
 
+/// Configuration map (runtime configurable from userspace)
+/// Index 0: Log level (0=None, 1=DropsOnly, 2=Filtered, 3=All)
+#[map]
+static CONFIG: Array<u8> = Array::with_max_entries(10, 0);
+
+/// Get current log level from CONFIG map
+#[inline(always)]
+fn get_log_level() -> LogLevel {
+	match CONFIG.get(CONFIG_LOG_LEVEL) {
+		Some(level) => LogLevel::try_from(*level).unwrap_or(LogLevel::Filtered),
+		None => LogLevel::Filtered, // Default to filtered mode
+	}
+}
+
 /// Helper function to increment a statistic counter with zero overhead
 /// Uses get_ptr_mut for direct memory access without bounds checking in hot path
 #[inline(always)]
@@ -67,29 +81,31 @@ fn inc_port_stat(port: u16) {
 /// Check if packet port has a filtering rule and apply it
 /// Returns Some(action) if rule exists, None if no rule (pass through)
 #[inline(always)]
-fn check_port_rule(
-	ctx: &XdpContext,
-	src_port: u16,
-	dst_port: u16,
-	proto_name: &str,
-) -> Option<u32> {
+fn check_port_rule(ctx: &XdpContext, src_port: u16, dst_port: u16) -> Option<u32> {
+	let log_level = get_log_level();
+
 	// Check destination port first (more common for server ports)
 	if let Some(action_code) = unsafe { PORT_RULES.get(&dst_port) } {
 		inc_stat(STAT_SUBSTRATE_PACKETS);
 		inc_port_stat(dst_port);
-		info!(ctx, "🔍 Filtered port {} ({}) - dst", dst_port, proto_name);
 
 		match Action::try_from(*action_code) {
 			Ok(Action::Drop) => {
-				info!(ctx, "⛔ Dropping packet to port {}", dst_port);
+				if log_level >= LogLevel::DropsOnly {
+					info!(ctx, "⛔ Dropping packet to port {}", dst_port);
+				}
 				return Some(xdp_action::XDP_DROP);
 			},
 			Ok(Action::Pass) => {
-				info!(ctx, "✅ Allowing packet to port {}", dst_port);
+				if log_level >= LogLevel::Filtered {
+					info!(ctx, "✅ Allowing packet to port {}", dst_port);
+				}
 				return Some(xdp_action::XDP_PASS);
 			},
 			Ok(Action::LogOnly) => {
-				info!(ctx, "📝 Logging packet to port {} (pass through)", dst_port);
+				if log_level >= LogLevel::Filtered {
+					info!(ctx, "📝 Logging packet to port {} (pass through)", dst_port);
+				}
 				// Continue processing, don't return
 			},
 			Err(_) => {
@@ -102,19 +118,24 @@ fn check_port_rule(
 	if let Some(action_code) = unsafe { PORT_RULES.get(&src_port) } {
 		inc_stat(STAT_SUBSTRATE_PACKETS);
 		inc_port_stat(src_port);
-		info!(ctx, "🔍 Filtered port {} ({}) - src", src_port, proto_name);
 
 		match Action::try_from(*action_code) {
 			Ok(Action::Drop) => {
-				info!(ctx, "⛔ Dropping packet from port {}", src_port);
+				if log_level >= LogLevel::DropsOnly {
+					info!(ctx, "⛔ Dropping packet from port {}", src_port);
+				}
 				return Some(xdp_action::XDP_DROP);
 			},
 			Ok(Action::Pass) => {
-				info!(ctx, "✅ Allowing packet from port {}", src_port);
+				if log_level >= LogLevel::Filtered {
+					info!(ctx, "✅ Allowing packet from port {}", src_port);
+				}
 				return Some(xdp_action::XDP_PASS);
 			},
 			Ok(Action::LogOnly) => {
-				info!(ctx, "📝 Logging packet from port {} (pass through)", src_port);
+				if log_level >= LogLevel::Filtered {
+					info!(ctx, "📝 Logging packet from port {} (pass through)", src_port);
+				}
 				// Continue processing, don't return
 			},
 			Err(_) => {
@@ -151,6 +172,8 @@ fn try_fractalize_ebpf(ctx: XdpContext) -> Result<u32, ()> {
 	// Count total packets processed
 	inc_stat(STAT_TOTAL_PACKETS);
 
+	let log_level = get_log_level();
+
 	// Parse Ethernet header - use offset_of! for efficiency (only validate the field we need)
 	let ether_type: *const EtherType = ptr_at(&ctx, mem::offset_of!(EthHdr, ether_type))?;
 
@@ -162,18 +185,20 @@ fn try_fractalize_ebpf(ctx: XdpContext) -> Result<u32, ()> {
 			let src_addr = unsafe { (*ipv4hdr).src_addr };
 			let dst_addr = unsafe { (*ipv4hdr).dst_addr };
 
-			info!(
-				&ctx,
-				"IPv4: {}.{}.{}.{} → {}.{}.{}.{}",
-				src_addr[0],
-				src_addr[1],
-				src_addr[2],
-				src_addr[3],
-				dst_addr[0],
-				dst_addr[1],
-				dst_addr[2],
-				dst_addr[3]
-			);
+			if log_level == LogLevel::All {
+				info!(
+					&ctx,
+					"IPv4: {}.{}.{}.{} → {}.{}.{}.{}",
+					src_addr[0],
+					src_addr[1],
+					src_addr[2],
+					src_addr[3],
+					dst_addr[0],
+					dst_addr[1],
+					dst_addr[2],
+					dst_addr[3]
+				);
+			}
 
 			let proto = unsafe { (*ipv4hdr).proto };
 			(proto, EthHdr::LEN + Ipv4Hdr::LEN)
@@ -184,26 +209,28 @@ fn try_fractalize_ebpf(ctx: XdpContext) -> Result<u32, ()> {
 			let src_addr = unsafe { (*ipv6hdr).src_addr };
 			let dst_addr = unsafe { (*ipv6hdr).dst_addr };
 
-			info!(
-				&ctx,
-				"IPv6: {:x}{:x}:{:x}{:x}:{:x}{:x}:{:x}{:x}... → {:x}{:x}:{:x}{:x}:{:x}{:x}:{:x}{:x}...",
-				src_addr[0],
-				src_addr[1],
-				src_addr[2],
-				src_addr[3],
-				src_addr[4],
-				src_addr[5],
-				src_addr[6],
-				src_addr[7],
-				dst_addr[0],
-				dst_addr[1],
-				dst_addr[2],
-				dst_addr[3],
-				dst_addr[4],
-				dst_addr[5],
-				dst_addr[6],
-				dst_addr[7]
-			);
+			if log_level == LogLevel::All {
+				info!(
+					&ctx,
+					"IPv6: {:x}{:x}:{:x}{:x}:{:x}{:x}:{:x}{:x}... → {:x}{:x}:{:x}{:x}:{:x}{:x}:{:x}{:x}...",
+					src_addr[0],
+					src_addr[1],
+					src_addr[2],
+					src_addr[3],
+					src_addr[4],
+					src_addr[5],
+					src_addr[6],
+					src_addr[7],
+					dst_addr[0],
+					dst_addr[1],
+					dst_addr[2],
+					dst_addr[3],
+					dst_addr[4],
+					dst_addr[5],
+					dst_addr[6],
+					dst_addr[7]
+				);
+			}
 
 			let next_hdr = unsafe { (*ipv6hdr).next_hdr };
 			(next_hdr, EthHdr::LEN + Ipv6Hdr::LEN)
@@ -223,10 +250,12 @@ fn try_fractalize_ebpf(ctx: XdpContext) -> Result<u32, ()> {
 			let src_port = unsafe { u16::from_be_bytes((*tcphdr).source) };
 			let dst_port = unsafe { u16::from_be_bytes((*tcphdr).dest) };
 
-			info!(&ctx, "TCP: port {} → {}", src_port, dst_port);
+			if log_level == LogLevel::All {
+				info!(&ctx, "TCP: port {} → {}", src_port, dst_port);
+			}
 
 			// Check for port-based filtering rules
-			if let Some(action) = check_port_rule(&ctx, src_port, dst_port, "TCP") {
+			if let Some(action) = check_port_rule(&ctx, src_port, dst_port) {
 				return Ok(action);
 			}
 		},
@@ -236,10 +265,12 @@ fn try_fractalize_ebpf(ctx: XdpContext) -> Result<u32, ()> {
 			let src_port = unsafe { u16::from_be_bytes((*udphdr).src) };
 			let dst_port = unsafe { u16::from_be_bytes((*udphdr).dst) };
 
-			info!(&ctx, "UDP: port {} → {}", src_port, dst_port);
+			if log_level == LogLevel::All {
+				info!(&ctx, "UDP: port {} → {}", src_port, dst_port);
+			}
 
 			// Check for port-based filtering rules
-			if let Some(action) = check_port_rule(&ctx, src_port, dst_port, "UDP/QUIC") {
+			if let Some(action) = check_port_rule(&ctx, src_port, dst_port) {
 				return Ok(action);
 			}
 		},

@@ -44,3 +44,52 @@ pub mod actions {
 		}
 	}
 }
+
+/// Logging control configuration
+pub mod logging {
+	use super::*;
+
+	/// Log level for controlling verbosity
+	#[repr(u8)]
+	#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+	pub enum LogLevel {
+		/// No logging (silent mode)
+		None,
+		/// Log only dropped packets
+		DropsOnly,
+		/// Log filtered packets (drops + matches)
+		Filtered,
+		/// Log all packets (very verbose)
+		All,
+	}
+
+	impl LogLevel {
+		/// Get the log level as a static string
+		pub const fn as_str(&self) -> &'static str {
+			match self {
+				Self::None => "NONE",
+				Self::DropsOnly => "DROPS_ONLY",
+				Self::Filtered => "FILTERED",
+				Self::All => "ALL",
+			}
+		}
+	}
+
+	/// Convert u8 to LogLevel (standard Rust trait)
+	impl TryFrom<u8> for LogLevel {
+		type Error = ();
+
+		fn try_from(val: u8) -> Result<Self, Self::Error> {
+			match val {
+				0 => Ok(LogLevel::None),
+				1 => Ok(LogLevel::DropsOnly),
+				2 => Ok(LogLevel::Filtered),
+				3 => Ok(LogLevel::All),
+				_ => Err(()),
+			}
+		}
+	}
+
+	/// Configuration indices for CONFIG map
+	pub const CONFIG_LOG_LEVEL: u32 = 0;
+}

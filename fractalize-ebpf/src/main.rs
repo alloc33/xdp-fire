@@ -4,7 +4,8 @@ use aya::{
 	programs::{Xdp, XdpFlags},
 };
 use clap::{Parser, Subcommand};
-use fractalize_ebpf_common::actions::*;
+use core::convert::TryFrom;
+use fractalize_ebpf_common::{actions::*, logging::*};
 #[rustfmt::skip]
 use log::{debug, info, warn};
 use tokio::{
@@ -52,6 +53,16 @@ enum Commands {
 		#[clap(short, long)]
 		port: Option<u16>,
 	},
+
+	/// Set log level (0=NONE, 1=DROPS_ONLY, 2=FILTERED, 3=ALL)
+	SetLogLevel {
+		/// Log level: 0=NONE, 1=DROPS_ONLY, 2=FILTERED, 3=ALL
+		#[clap(short, long)]
+		level: u8,
+	},
+
+	/// Get current log level
+	GetLogLevel,
 }
 
 const MAP_PIN_PATH: &str = "/sys/fs/bpf/fractalize-ebpf";
@@ -59,15 +70,49 @@ const MAP_PIN_PATH: &str = "/sys/fs/bpf/fractalize-ebpf";
 async fn handle_command(command: &Commands) -> anyhow::Result<()> {
 	use std::path::Path;
 
-	// Access the pinned map
-	let map_path = Path::new(MAP_PIN_PATH).join("PORT_RULES");
-	let map_data = MapData::from_pin(&map_path)
-		.context("Failed to open pinned PORT_RULES map. Is the XDP program running?")?;
-
-	let mut map = Map::from_map_data(map_data)?;
-	let mut port_rules: HashMap<_, u16, u8> = HashMap::try_from(&mut map)?;
-
 	match command {
+		Commands::SetLogLevel { level } => {
+			// Access CONFIG map for log level commands
+			let config_path = Path::new(MAP_PIN_PATH).join("CONFIG");
+			let config_data = MapData::from_pin(&config_path)
+				.context("Failed to open pinned CONFIG map. Is the XDP program running?")?;
+
+			let mut config_map = Map::from_map_data(config_data)?;
+			let mut config: Array<_, u8> = Array::try_from(&mut config_map)?;
+
+			config.set(CONFIG_LOG_LEVEL, *level, 0)?;
+			let level_str = LogLevel::try_from(*level).ok().map(|l| l.as_str()).unwrap_or("UNKNOWN");
+			info!("✅ Set log level to: {}", level_str);
+		},
+		Commands::GetLogLevel => {
+			// Access CONFIG map for log level commands
+			let config_path = Path::new(MAP_PIN_PATH).join("CONFIG");
+			let config_data = MapData::from_pin(&config_path)
+				.context("Failed to open pinned CONFIG map. Is the XDP program running?")?;
+
+			let mut config_map = Map::from_map_data(config_data)?;
+			let config: Array<_, u8> = Array::try_from(&mut config_map)?;
+
+			match config.get(&CONFIG_LOG_LEVEL, 0) {
+				Ok(level) => {
+					let level_str = LogLevel::try_from(level).ok().map(|l| l.as_str()).unwrap_or("UNKNOWN");
+					info!("📋 Current log level: {} ({})", level_str, level);
+				},
+				Err(_) => {
+					info!("📋 Log level not set (default: FILTERED)");
+				},
+			}
+		},
+		_ => {
+			// Access PORT_RULES map for port-related commands
+			let map_path = Path::new(MAP_PIN_PATH).join("PORT_RULES");
+			let map_data = MapData::from_pin(&map_path)
+				.context("Failed to open pinned PORT_RULES map. Is the XDP program running?")?;
+
+			let mut map = Map::from_map_data(map_data)?;
+			let mut port_rules: HashMap<_, u16, u8> = HashMap::try_from(&mut map)?;
+
+			match command {
 		Commands::AddRule { port, action } => {
 			port_rules.insert(*port, *action, 0)?;
 			let action_str = Action::try_from(*action).ok().map(|a| a.as_str()).unwrap_or("UNKNOWN");
@@ -121,6 +166,9 @@ async fn handle_command(command: &Commands) -> anyhow::Result<()> {
 				if !found_any {
 					info!("   No packet statistics collected yet");
 				}
+			}
+		},
+				_ => unreachable!(),
 			}
 		},
 	}
@@ -190,10 +238,16 @@ async fn main() -> anyhow::Result<()> {
 	let port_stats: HashMap<_, u16, u64> = ebpf.map_mut("PORT_STATS").unwrap().try_into()?;
 	port_stats.pin(map_pin_path.join("PORT_STATS"))?;
 
+	// Pin CONFIG map for runtime log level control
+	let mut config: Array<_, u8> = ebpf.map_mut("CONFIG").unwrap().try_into()?;
+	config.set(CONFIG_LOG_LEVEL, LogLevel::Filtered as u8, 0)?; // Default to Filtered mode
+	config.pin(map_pin_path.join("CONFIG"))?;
+
 	info!("✅ Configured port filtering rules:");
 	info!("   Port 30333 (Substrate P2P): LOG_ONLY");
 	info!("📍 Pinned PORT_RULES map to {}/PORT_RULES", MAP_PIN_PATH);
 	info!("📍 Pinned PORT_STATS map to {}/PORT_STATS", MAP_PIN_PATH);
+	info!("📍 Pinned CONFIG map to {}/CONFIG (log level: FILTERED)", MAP_PIN_PATH);
 
 	let Opt { iface, .. } = opt;
 	let program: &mut Xdp = ebpf.program_mut("fractalize_ebpf").unwrap().try_into()?;
