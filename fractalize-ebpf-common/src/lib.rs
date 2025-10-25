@@ -169,3 +169,137 @@ pub mod rate_limit {
 		}
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	// Action enum tests - these are stored as u8 in eBPF maps, so we need to make sure
+	// the conversion from raw bytes works correctly
+	#[test]
+	fn test_action_try_from() {
+		// Valid conversions
+		assert_eq!(actions::Action::try_from(0), Ok(actions::Action::Pass));
+		assert_eq!(actions::Action::try_from(1), Ok(actions::Action::Drop));
+		assert_eq!(actions::Action::try_from(2), Ok(actions::Action::LogOnly));
+
+		// Invalid values should fail - important for security
+		assert_eq!(actions::Action::try_from(3), Err(()));
+		assert_eq!(actions::Action::try_from(255), Err(()));
+	}
+
+	#[test]
+	fn test_action_as_str() {
+		// Used in CLI output, make sure strings are correct
+		assert_eq!(actions::Action::Pass.as_str(), "PASS");
+		assert_eq!(actions::Action::Drop.as_str(), "DROP");
+		assert_eq!(actions::Action::LogOnly.as_str(), "LOG_ONLY");
+	}
+
+	// LogLevel tests - these control verbosity in the kernel logs
+	#[test]
+	fn test_loglevel_try_from() {
+		// Make sure config values map correctly
+		assert_eq!(logging::LogLevel::try_from(0), Ok(logging::LogLevel::None));
+		assert_eq!(logging::LogLevel::try_from(1), Ok(logging::LogLevel::DropsOnly));
+		assert_eq!(logging::LogLevel::try_from(2), Ok(logging::LogLevel::Filtered));
+		assert_eq!(logging::LogLevel::try_from(3), Ok(logging::LogLevel::All));
+		assert_eq!(logging::LogLevel::try_from(4), Err(())); // Out of range
+	}
+
+	#[test]
+	fn test_loglevel_ordering() {
+		// We use comparisons like `if log_level >= LogLevel::DropsOnly` in kernel code
+		// so ordering must be correct
+		assert!(logging::LogLevel::None < logging::LogLevel::DropsOnly);
+		assert!(logging::LogLevel::DropsOnly < logging::LogLevel::Filtered);
+		assert!(logging::LogLevel::Filtered < logging::LogLevel::All);
+	}
+
+	#[test]
+	fn test_loglevel_as_str() {
+		assert_eq!(logging::LogLevel::None.as_str(), "NONE");
+		assert_eq!(logging::LogLevel::DropsOnly.as_str(), "DROPS_ONLY");
+		assert_eq!(logging::LogLevel::Filtered.as_str(), "FILTERED");
+		assert_eq!(logging::LogLevel::All.as_str(), "ALL");
+	}
+
+	// IpFilterMode tests - allowlist vs blocklist behavior is critical for security
+	#[test]
+	fn test_ipfiltermode_try_from() {
+		assert_eq!(ip_filter::IpFilterMode::try_from(0), Ok(ip_filter::IpFilterMode::Disabled));
+		assert_eq!(ip_filter::IpFilterMode::try_from(1), Ok(ip_filter::IpFilterMode::Blocklist));
+		assert_eq!(ip_filter::IpFilterMode::try_from(2), Ok(ip_filter::IpFilterMode::Allowlist));
+		assert_eq!(ip_filter::IpFilterMode::try_from(3), Err(())); // Invalid mode
+	}
+
+	#[test]
+	fn test_ipfiltermode_as_str() {
+		assert_eq!(ip_filter::IpFilterMode::Disabled.as_str(), "DISABLED");
+		assert_eq!(ip_filter::IpFilterMode::Blocklist.as_str(), "BLOCKLIST");
+		assert_eq!(ip_filter::IpFilterMode::Allowlist.as_str(), "ALLOWLIST");
+	}
+
+	// RateLimitState pack/unpack - THIS IS CRITICAL
+	// We pack two u32s into a single u64 to store in eBPF HashMap efficiently.
+	// If this is wrong, rate limiting won't work at all.
+	#[test]
+	fn test_rate_limit_state_pack_unpack() {
+		// Basic roundtrip with random values
+		let state = rate_limit::RateLimitState { last_seen_ms: 12345, packet_count: 67890 };
+
+		let packed = state.pack();
+		let unpacked = rate_limit::RateLimitState::unpack(packed);
+
+		assert_eq!(unpacked.last_seen_ms, 12345);
+		assert_eq!(unpacked.packet_count, 67890);
+	}
+
+	#[test]
+	fn test_rate_limit_state_pack_max_values() {
+		// Edge case: make sure we don't lose bits with max values
+		let state = rate_limit::RateLimitState { last_seen_ms: u32::MAX, packet_count: u32::MAX };
+
+		let packed = state.pack();
+		let unpacked = rate_limit::RateLimitState::unpack(packed);
+
+		assert_eq!(unpacked.last_seen_ms, u32::MAX);
+		assert_eq!(unpacked.packet_count, u32::MAX);
+	}
+
+	#[test]
+	fn test_rate_limit_state_pack_zero() {
+		// Initial state should pack to 0
+		let state = rate_limit::RateLimitState::new();
+		assert_eq!(state.last_seen_ms, 0);
+		assert_eq!(state.packet_count, 0);
+
+		let packed = state.pack();
+		assert_eq!(packed, 0);
+
+		// And unpacking 0 should give us back zeros
+		let unpacked = rate_limit::RateLimitState::unpack(0);
+		assert_eq!(unpacked.last_seen_ms, 0);
+		assert_eq!(unpacked.packet_count, 0);
+	}
+
+	#[test]
+	fn test_rate_limit_state_pack_bit_layout() {
+		// Manually verify the bit layout is correct (timestamp in upper 32, count in lower 32)
+		// This is important because we're doing manual bit manipulation
+		let state =
+			rate_limit::RateLimitState { last_seen_ms: 0xABCD_1234, packet_count: 0x5678_9ABC };
+
+		let packed = state.pack();
+
+		// Should be: timestamp << 32 | count
+		assert_eq!(packed, 0xABCD_1234_5678_9ABC);
+
+		// Double-check we can extract the parts
+		let timestamp_part = (packed >> 32) as u32;
+		let count_part = (packed & 0xFFFF_FFFF) as u32;
+
+		assert_eq!(timestamp_part, 0xABCD_1234);
+		assert_eq!(count_part, 0x5678_9ABC);
+	}
+}

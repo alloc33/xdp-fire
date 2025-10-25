@@ -491,3 +491,90 @@ async fn main() -> anyhow::Result<()> {
 
 	Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	// IPv6 conversion tests - we store IPv6 as [u32; 4] in eBPF maps because
+	// eBPF doesn't handle complex types well. Need to make sure conversion is lossless.
+
+	#[test]
+	fn test_ipv6_to_u32_array_simple() {
+		// Simple address with :: notation
+		let ipv6 = "2001:db8::1".parse::<Ipv6Addr>().unwrap();
+		let array = ipv6_to_u32_array(&ipv6);
+
+		// 2001:0db8:0000:0000:0000:0000:0000:0001
+		assert_eq!(array[0], 0x2001_0db8);
+		assert_eq!(array[1], 0x0000_0000);
+		assert_eq!(array[2], 0x0000_0000);
+		assert_eq!(array[3], 0x0000_0001);
+	}
+
+	#[test]
+	fn test_ipv6_to_u32_array_full() {
+		// Full IPv6 address with all sections populated
+		let ipv6 = "2001:db8:85a3::8a2e:370:7334".parse::<Ipv6Addr>().unwrap();
+		let array = ipv6_to_u32_array(&ipv6);
+
+		assert_eq!(array[0], 0x2001_0db8);
+		assert_eq!(array[1], 0x85a3_0000);
+		assert_eq!(array[2], 0x0000_8a2e);
+		assert_eq!(array[3], 0x0370_7334);
+	}
+
+	#[test]
+	fn test_ipv6_to_u32_array_loopback() {
+		// Edge case: loopback address (::1)
+		let ipv6 = "::1".parse::<Ipv6Addr>().unwrap();
+		let array = ipv6_to_u32_array(&ipv6);
+
+		assert_eq!(array[0], 0x0000_0000);
+		assert_eq!(array[1], 0x0000_0000);
+		assert_eq!(array[2], 0x0000_0000);
+		assert_eq!(array[3], 0x0000_0001);
+	}
+
+	#[test]
+	fn test_u32_array_to_ipv6_roundtrip() {
+		// Most important test - make sure we don't lose any data during conversion
+		// Test multiple addresses including edge cases
+		let test_cases = [
+			"2001:db8::1",
+			"::1",     // Loopback
+			"fe80::1", // Link-local
+			"2001:db8:85a3::8a2e:370:7334",
+			"::",                                      // All zeros
+			"ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", // All ones
+		];
+
+		for case in &test_cases {
+			let original = case.parse::<Ipv6Addr>().unwrap();
+			let array = ipv6_to_u32_array(&original);
+			let converted = u32_array_to_ipv6(&array);
+			assert_eq!(original, converted, "Roundtrip failed for {}", case);
+		}
+	}
+
+	#[test]
+	fn test_u32_array_to_ipv6_manual() {
+		// Manually verify the reverse conversion works
+		let array: [u32; 4] = [0x2001_0db8, 0x0000_0000, 0x0000_0000, 0x0000_0001];
+		let ipv6 = u32_array_to_ipv6(&array);
+		let expected = "2001:db8::1".parse::<Ipv6Addr>().unwrap();
+		assert_eq!(ipv6, expected);
+	}
+
+	#[test]
+	fn test_ipv6_network_byte_order() {
+		// Critical: IPv6 addresses must be in network byte order (big-endian)
+		// for eBPF map lookups to work correctly
+		let ipv6 = "2001:db8::1".parse::<Ipv6Addr>().unwrap();
+		let array = ipv6_to_u32_array(&ipv6);
+
+		// First u32 should be 0x2001_0db8 in big-endian
+		// If we were using little-endian (wrong!), it would be 0xb80d_0120
+		assert_eq!(array[0], 0x2001_0db8, "Not using network byte order!");
+	}
+}
