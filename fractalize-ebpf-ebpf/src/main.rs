@@ -328,7 +328,8 @@ fn try_fractalize_ebpf(ctx: XdpContext) -> Result<u32, ()> {
 			}
 
 			let proto = unsafe { (*ipv4hdr).proto };
-			(proto, EthHdr::LEN + Ipv4Hdr::LEN)
+			let ihl = unsafe { (*ipv4hdr).ihl() }; // Get header length (20-60 bytes)
+			(proto, EthHdr::LEN + ihl as usize)
 		},
 		EtherType::Ipv6 => {
 			// IPv6
