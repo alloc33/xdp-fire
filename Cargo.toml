@@ -1,11 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
-    "fractalize-ebpf",
-    "fractalize-ebpf-common",
-    "fractalize-ebpf-ebpf",
+    "xdp-fire",
+    "xdp-fire-common",
+    "xdp-fire-ebpf",
 ]
-default-members = ["fractalize-ebpf", "fractalize-ebpf-common"]
+default-members = ["xdp-fire", "xdp-fire-common"]
 
 [workspace.package]
 license = "MIT OR Apache-2.0"
@@ -30,6 +30,6 @@ log = { version = "0.4.22", default-features = false }
 tokio = { version = "1.40.0", default-features = false }
 which = { version = "6.0.0", default-features = false }
 
-[profile.release.package.fractalize-ebpf-ebpf]
+[profile.release.package.xdp-fire-ebpf]
 debug = 2
 codegen-units = 1

@@ -10,7 +10,7 @@ use aya_ebpf::{
 };
 use aya_log_ebpf::info;
 use core::{convert::TryFrom, mem};
-use fractalize_ebpf_common::{actions::*, ip_filter::*, logging::*, rate_limit::*};
+use xdp_fire_common::{actions::*, ip_filter::*, logging::*, rate_limit::*};
 use network_types::{
 	eth::{EthHdr, EtherType},
 	ip::{IpProto, Ipv4Hdr, Ipv6Hdr},
@@ -295,14 +295,14 @@ fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
 }
 
 #[xdp]
-pub fn fractalize_ebpf(ctx: XdpContext) -> u32 {
-	match try_fractalize_ebpf(ctx) {
+pub fn xdp_fire(ctx: XdpContext) -> u32 {
+	match try_xdp_fire(ctx) {
 		Ok(ret) => ret,
 		Err(_) => xdp_action::XDP_ABORTED,
 	}
 }
 
-fn try_fractalize_ebpf(ctx: XdpContext) -> Result<u32, ()> {
+fn try_xdp_fire(ctx: XdpContext) -> Result<u32, ()> {
 	// Count total packets processed
 	inc_stat(STAT_TOTAL_PACKETS);
 

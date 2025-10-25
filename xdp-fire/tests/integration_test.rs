@@ -1,4 +1,4 @@
-//! Integration tests for fractalize-ebpf
+//! Integration tests for xdp-fire
 //!
 //! These tests verify:
 //! 1. eBPF program loads successfully
@@ -6,15 +6,15 @@
 //! 3. Configuration changes work correctly
 //! 4. Statistics are tracked properly
 //!
-//! Run with: ./scripts/ubuntu-exec.sh "cd /root/fractalize-ebpf && cargo test"
+//! Run with: ./scripts/ubuntu-exec.sh "cd /root/xdp-fire && cargo test"
 
 use aya::{
 	Ebpf,
 	maps::{Array, HashMap},
 };
-use fractalize_ebpf_common::{actions::Action, ip_filter::IpFilterMode, logging::LogLevel};
+use xdp_fire_common::{actions::Action, ip_filter::IpFilterMode, logging::LogLevel};
 
-// Config array indices (from fractalize-ebpf-ebpf/src/main.rs)
+// Config array indices (from xdp-fire-ebpf/src/main.rs)
 const CONFIG_LOG_LEVEL: u32 = 0;
 const CONFIG_IP_FILTER_MODE: u32 = 1;
 const CONFIG_RATE_LIMIT_ENABLED: u32 = 2;
@@ -22,7 +22,7 @@ const CONFIG_RATE_LIMIT_ENABLED: u32 = 2;
 /// Load the eBPF program without attaching it
 fn load_ebpf() -> Result<Ebpf, Box<dyn std::error::Error>> {
 	// Read the compiled eBPF bytecode using the same approach as main.rs
-	let ebpf_bytes = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/fractalize-ebpf"));
+	let ebpf_bytes = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/xdp-fire"));
 
 	// Load it into the kernel (but don't attach)
 	let ebpf = Ebpf::load(ebpf_bytes)?;

@@ -5,7 +5,7 @@ use aya::{
 };
 use clap::{Parser, Subcommand};
 use core::convert::TryFrom;
-use fractalize_ebpf_common::{actions::*, ip_filter::*, logging::*};
+use xdp_fire_common::{actions::*, ip_filter::*, logging::*};
 #[rustfmt::skip]
 use log::{debug, info, warn};
 use std::{
@@ -57,7 +57,7 @@ where
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "fractalize-ebpf")]
+#[command(name = "xdp-fire")]
 #[command(about = "XDP packet filter with runtime configuration")]
 struct Opt {
 	#[command(subcommand)]
@@ -152,7 +152,7 @@ enum Commands {
 	GetRateLimit,
 }
 
-const MAP_PIN_PATH: &str = "/sys/fs/bpf/fractalize-ebpf";
+const MAP_PIN_PATH: &str = "/sys/fs/bpf/xdp-fire";
 
 async fn handle_command(command: &Commands) -> anyhow::Result<()> {
 	match command {
@@ -359,7 +359,7 @@ async fn main() -> anyhow::Result<()> {
 	// like to specify the eBPF program at runtime rather than at compile-time, you can
 	// reach for `Bpf::load_file` instead.
 	let mut ebpf =
-		aya::Ebpf::load(aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/fractalize-ebpf")))?;
+		aya::Ebpf::load(aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/xdp-fire")))?;
 	match aya_log::EbpfLogger::init(&mut ebpf) {
 		Err(e) => {
 			// This can happen if you remove all log statements from your eBPF program.
@@ -440,7 +440,7 @@ async fn main() -> anyhow::Result<()> {
 	info!("📍 Pinned RATE_LIMIT_STATE_V6 map to {}/RATE_LIMIT_STATE_V6", MAP_PIN_PATH);
 
 	let Opt { iface, .. } = opt;
-	let program: &mut Xdp = ebpf.program_mut("fractalize_ebpf").unwrap().try_into()?;
+	let program: &mut Xdp = ebpf.program_mut("xdp_fire").unwrap().try_into()?;
 	program.load()?;
 
 	// Try native XDP first (driver mode), fall back to generic/SKB mode if not supported

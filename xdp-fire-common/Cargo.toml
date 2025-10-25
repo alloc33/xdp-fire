@@ -1,5 +1,5 @@
 [package]
-name = "fractalize-ebpf-common"
+name = "xdp-fire-common"
 version = "0.1.0"
 edition.workspace = true
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Benchmark script for fractalize-ebpf XDP filter
+# Benchmark script for xdp-fire XDP filter
 # Tests packet filtering performance on loopback interface
 
 set -e
@@ -9,7 +9,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-echo -e "${GREEN}=== Fractalize-eBPF Benchmark ===${NC}"
+echo -e "${GREEN}=== xdp-fire Benchmark ===${NC}"
 echo ""
 
 # Check if running as root
@@ -26,12 +26,12 @@ fi
 
 DURATION=10
 IFACE="lo"
-PROJECT_DIR="/root/fractalize-ebpf"
-BINARY="$PROJECT_DIR/target/release/fractalize-ebpf"
+PROJECT_DIR="/root/xdp-fire"
+BINARY="$PROJECT_DIR/target/release/xdp-fire"
 
 # Build if needed
 if [ ! -f "$BINARY" ]; then
-    echo -e "${YELLOW}Building fractalize-ebpf...${NC}"
+    echo -e "${YELLOW}Building xdp-fire...${NC}"
     cd "$PROJECT_DIR" && cargo build --release
 fi
 
@@ -39,7 +39,7 @@ fi
 cleanup() {
     echo -e "\n${YELLOW}Cleaning up...${NC}"
     pkill -f iperf3 || true
-    pkill -f fractalize-ebpf || true
+    pkill -f xdp-fire || true
     sleep 1
 }
 

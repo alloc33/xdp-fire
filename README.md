@@ -1,57 +1,95 @@
-# fractalize-ebpf
+# xdp-fire
 
-## Prerequisites
+🔥 XDP-based firewall written in pure Rust 🦀. Filters packets at kernel level before they hit your network stack.
 
-1. stable rust toolchains: `rustup toolchain install stable`
-1. nightly rust toolchains: `rustup toolchain install nightly --component rust-src`
-1. (if cross-compiling) rustup target: `rustup target add ${ARCH}-unknown-linux-musl`
-1. (if cross-compiling) LLVM: (e.g.) `brew install llvm` (on macOS)
-1. (if cross-compiling) C toolchain: (e.g.) [`brew install filosottile/musl-cross/musl-cross`](https://github.com/FiloSottile/homebrew-musl-cross) (on macOS)
-1. bpf-linker: `cargo install bpf-linker` (`--no-default-features` on macOS)
+---
 
-## Build & Run
+## Why
 
-Use `cargo build`, `cargo check`, etc. as normal. Run your program with:
+Block unwanted traffic at the **XDP layer** - the earliest point in Linux networking. Malicious packets get dropped at the NIC, not in userspace.
 
-```shell
-cargo run --release
+```
+NIC → XDP (filter here) → Network Stack → Your App
 ```
 
-Cargo build scripts are used to automatically build the eBPF correctly and include it in the
-program.
+Fast. Efficient. Zero CPU waste on attack traffic.
 
-## Cross-compiling on macOS
+---
 
-Cross compilation should work on both Intel and Apple Silicon Macs.
+## Features
 
-```shell
-CC=${ARCH}-linux-musl-gcc cargo build --package fractalize-ebpf --release \
-  --target=${ARCH}-unknown-linux-musl \
-  --config=target.${ARCH}-unknown-linux-musl.linker=\"${ARCH}-linux-musl-gcc\"
+- IPv4/IPv6 filtering (allowlist/blocklist)
+- Port-based rules (drop/pass/log)
+- Per-IP rate limiting
+- Real-time statistics
+- Pure Rust (no C)
+
+---
+
+## Usage
+
+```bash
+# Start filtering
+sudo xdp-fire --iface eth0
+
+# Block port
+xdp-fire add-rule -p 8080 -a Drop
+
+# Rate limit (1000 pps per IP)
+xdp-fire set-rate-limit -e true -l 1000 -w 1000
+
+# Allowlist mode
+xdp-fire set-ip-mode -m allowlist
+xdp-fire add-ipv4 -i 192.168.1.100
+
+# Stats
+xdp-fire show-stats
 ```
-The cross-compiled program `target/${ARCH}-unknown-linux-musl/release/fractalize-ebpf` can be
-copied to a Linux server or VM and run there.
+
+---
+
+## Build
+
+```bash
+# Requirements
+rustup toolchain install stable
+rustup toolchain install nightly --component rust-src
+cargo install bpf-linker
+
+# Build
+cargo build --release
+
+# Run (requires root)
+sudo ./target/release/xdp-fire --iface <interface>
+```
+
+---
+
+## Testing
+
+25 tests covering eBPF loading, maps, and filtering logic.
+
+```bash
+cargo test --release
+```
+
+---
+
+## Limitations
+
+Stateless filtering only. No connection tracking, no config persistence, no GeoIP. Add them if you need them.
+
+---
+
+## Stack
+
+Built with [Aya](https://github.com/aya-rs/aya) - pure Rust eBPF framework.
+
+Kernel and userspace code both in Rust. No C required.
+
+---
 
 ## License
 
-With the exception of eBPF code, fractalize-ebpf is distributed under the terms
-of either the [MIT license] or the [Apache License] (version 2.0), at your
-option.
-
-Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in this crate by you, as defined in the Apache-2.0 license, shall
-be dual licensed as above, without any additional terms or conditions.
-
-### eBPF
-
-All eBPF code is distributed under either the terms of the
-[GNU General Public License, Version 2] or the [MIT license], at your
-option.
-
-Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in this project by you, as defined in the GPL-2 license, shall be
-dual licensed as above, without any additional terms or conditions.
-
-[Apache license]: LICENSE-APACHE
-[MIT license]: LICENSE-MIT
-[GNU General Public License, Version 2]: LICENSE-GPL2
+Userspace: MIT or Apache-2.0
+eBPF: GPL-2 or MIT

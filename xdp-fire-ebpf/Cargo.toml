@@ -1,10 +1,10 @@
 [package]
-name = "fractalize-ebpf-ebpf"
+name = "xdp-fire-ebpf"
 version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
-fractalize-ebpf-common = { path = "../fractalize-ebpf-common" }
+xdp-fire-common = { path = "../xdp-fire-common" }
 
 aya-ebpf = { workspace = true }
 aya-log-ebpf = { workspace = true }
@@ -14,5 +14,5 @@ network-types = { workspace = true }
 which = { workspace = true }
 
 [[bin]]
-name = "fractalize-ebpf"
+name = "xdp-fire"
 path = "src/main.rs"
