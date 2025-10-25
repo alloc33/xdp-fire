@@ -30,17 +30,29 @@ static PORT_RULES: HashMap<u16, u8> = HashMap::with_max_entries(100, 0);
 #[map]
 static PORT_STATS: HashMap<u16, u64> = HashMap::with_max_entries(100, 0);
 
-/// IP filter list (allowlist or blocklist, depending on mode)
+/// IPv4 filter list (allowlist or blocklist, depending on mode)
 /// Key: IPv4 address as u32 (network byte order)
 /// Value: 1 = present in list
 #[map]
-static IP_FILTER_LIST: HashMap<u32, u8> = HashMap::with_max_entries(10000, 0);
+static IP_FILTER_LIST_V4: HashMap<u32, u8> = HashMap::with_max_entries(10000, 0);
 
-/// Per-IP rate limiting state
+/// IPv6 filter list (allowlist or blocklist, depending on mode)
+/// Key: IPv6 address as [u32; 4] (network byte order)
+/// Value: 1 = present in list
+#[map]
+static IP_FILTER_LIST_V6: HashMap<[u32; 4], u8> = HashMap::with_max_entries(10000, 0);
+
+/// Per-IP rate limiting state for IPv4
 /// Key: IPv4 address as u32 (network byte order)
 /// Value: packed u64 (timestamp + packet count)
 #[map]
-static RATE_LIMIT_STATE: HashMap<u32, u64> = HashMap::with_max_entries(10000, 0);
+static RATE_LIMIT_STATE_V4: HashMap<u32, u64> = HashMap::with_max_entries(10000, 0);
+
+/// Per-IP rate limiting state for IPv6
+/// Key: IPv6 address as [u32; 4] (network byte order)
+/// Value: packed u64 (timestamp + packet count)
+#[map]
+static RATE_LIMIT_STATE_V6: HashMap<[u32; 4], u64> = HashMap::with_max_entries(10000, 0);
 
 // Statistics indices
 const STAT_TOTAL_PACKETS: u32 = 0;
@@ -85,19 +97,22 @@ fn get_ip_filter_mode() -> IpFilterMode {
 	}
 }
 
-/// Check if IP should be allowed based on filter mode
+/// Check if IP address should be allowed based on filter mode (generic for IPv4/IPv6)
 /// Returns true if packet should be allowed, false if it should be dropped
 #[inline(always)]
-fn check_ip_allowed(src_ip: u32, filter_mode: IpFilterMode) -> bool {
+fn check_ip_allowed<T>(map: &HashMap<T, u8>, ip: &T, filter_mode: IpFilterMode) -> bool
+where
+	T: Sized,
+{
 	match filter_mode {
 		IpFilterMode::Disabled => true, // No filtering, allow all
 		IpFilterMode::Blocklist => {
 			// If IP is in list, block it
-			unsafe { IP_FILTER_LIST.get(&src_ip).is_none() }
+			unsafe { map.get(ip).is_none() }
 		},
 		IpFilterMode::Allowlist => {
 			// If IP is in list, allow it
-			unsafe { IP_FILTER_LIST.get(&src_ip).is_some() }
+			unsafe { map.get(ip).is_some() }
 		},
 	}
 }
@@ -110,15 +125,31 @@ fn get_current_time_ms() -> u32 {
 	(unsafe { bpf_ktime_get_ns() } / 1_000_000) as u32
 }
 
-/// Check if IP is within rate limit
+/// Get rate limiting configuration from CONFIG map
+/// Returns (enabled, pps_limit, window_ms)
+#[inline(always)]
+fn get_rate_limit_config() -> (bool, u32, u32) {
+	let enabled = match CONFIG.get(CONFIG_RATE_LIMIT_ENABLED) {
+		Some(val) => *val != 0,
+		None => false,
+	};
+	let pps_limit = CONFIG.get(CONFIG_RATE_LIMIT_PPS).copied().unwrap_or(1000);
+	let window_ms = CONFIG.get(CONFIG_RATE_LIMIT_WINDOW_MS).copied().unwrap_or(1000);
+	(enabled, pps_limit, window_ms)
+}
+
+/// Check if IP address is within rate limit (generic for IPv4/IPv6)
 /// Returns true if packet should be allowed, false if rate limit exceeded
 #[inline(always)]
-fn check_rate_limit(src_ip: u32, pps_limit: u32, window_ms: u32) -> bool {
+fn check_rate_limit<T>(map: &HashMap<T, u64>, ip: &T, pps_limit: u32, window_ms: u32) -> bool
+where
+	T: Sized,
+{
 	let current_time_ms = get_current_time_ms();
 
 	// Get current state for this IP
 	let state = unsafe {
-		match RATE_LIMIT_STATE.get(&src_ip) {
+		match map.get(ip) {
 			Some(packed) => RateLimitState::unpack(*packed),
 			None => RateLimitState::new(),
 		}
@@ -137,7 +168,7 @@ fn check_rate_limit(src_ip: u32, pps_limit: u32, window_ms: u32) -> bool {
 
 	// Update state in map
 	let packed = new_state.pack();
-	let _ = RATE_LIMIT_STATE.insert(&src_ip, &packed, 0);
+	let _ = map.insert(ip, &packed, 0);
 
 	// Check if we're over the limit
 	new_state.packet_count <= pps_limit
@@ -161,6 +192,40 @@ fn inc_port_stat(port: u16) {
 	}
 }
 
+/// Macro to check a single port rule and handle action
+/// Reduces code duplication for src/dst port checks
+macro_rules! check_single_port {
+	($ctx:expr, $port:expr, $log_level:expr, $direction:expr) => {
+		if let Some(action_code) = unsafe { PORT_RULES.get(&$port) } {
+			inc_stat(STAT_SUBSTRATE_PACKETS);
+			inc_port_stat($port);
+
+			match Action::try_from(*action_code) {
+				Ok(Action::Drop) => {
+					if $log_level >= LogLevel::DropsOnly {
+						info!($ctx, "⛔ Dropping packet {} port {}", $direction, $port);
+					}
+					return Some(xdp_action::XDP_DROP);
+				},
+				Ok(Action::Pass) => {
+					if $log_level >= LogLevel::Filtered {
+						info!($ctx, "✅ Allowing packet {} port {}", $direction, $port);
+					}
+					return Some(xdp_action::XDP_PASS);
+				},
+				Ok(Action::LogOnly) =>
+					if $log_level >= LogLevel::Filtered {
+						info!(
+							$ctx,
+							"📝 Logging packet {} port {} (pass through)", $direction, $port
+						);
+					},
+				Err(_) => {},
+			}
+		}
+	};
+}
+
 /// Check if packet port has a filtering rule and apply it
 /// Returns Some(action) if rule exists, None if no rule (pass through)
 #[inline(always)]
@@ -168,64 +233,10 @@ fn check_port_rule(ctx: &XdpContext, src_port: u16, dst_port: u16) -> Option<u32
 	let log_level = get_log_level();
 
 	// Check destination port first (more common for server ports)
-	if let Some(action_code) = unsafe { PORT_RULES.get(&dst_port) } {
-		inc_stat(STAT_SUBSTRATE_PACKETS);
-		inc_port_stat(dst_port);
-
-		match Action::try_from(*action_code) {
-			Ok(Action::Drop) => {
-				if log_level >= LogLevel::DropsOnly {
-					info!(ctx, "⛔ Dropping packet to port {}", dst_port);
-				}
-				return Some(xdp_action::XDP_DROP);
-			},
-			Ok(Action::Pass) => {
-				if log_level >= LogLevel::Filtered {
-					info!(ctx, "✅ Allowing packet to port {}", dst_port);
-				}
-				return Some(xdp_action::XDP_PASS);
-			},
-			Ok(Action::LogOnly) => {
-				if log_level >= LogLevel::Filtered {
-					info!(ctx, "📝 Logging packet to port {} (pass through)", dst_port);
-				}
-				// Continue processing, don't return
-			},
-			Err(_) => {
-				// Unknown action, pass through
-			},
-		}
-	}
+	check_single_port!(ctx, dst_port, log_level, "to");
 
 	// Check source port (for responses from monitored services)
-	if let Some(action_code) = unsafe { PORT_RULES.get(&src_port) } {
-		inc_stat(STAT_SUBSTRATE_PACKETS);
-		inc_port_stat(src_port);
-
-		match Action::try_from(*action_code) {
-			Ok(Action::Drop) => {
-				if log_level >= LogLevel::DropsOnly {
-					info!(ctx, "⛔ Dropping packet from port {}", src_port);
-				}
-				return Some(xdp_action::XDP_DROP);
-			},
-			Ok(Action::Pass) => {
-				if log_level >= LogLevel::Filtered {
-					info!(ctx, "✅ Allowing packet from port {}", src_port);
-				}
-				return Some(xdp_action::XDP_PASS);
-			},
-			Ok(Action::LogOnly) => {
-				if log_level >= LogLevel::Filtered {
-					info!(ctx, "📝 Logging packet from port {} (pass through)", src_port);
-				}
-				// Continue processing, don't return
-			},
-			Err(_) => {
-				// Unknown action, pass through
-			},
-		}
-	}
+	check_single_port!(ctx, src_port, log_level, "from");
 
 	None
 }
@@ -257,6 +268,7 @@ fn try_fractalize_ebpf(ctx: XdpContext) -> Result<u32, ()> {
 
 	let log_level = get_log_level();
 	let ip_filter_mode = get_ip_filter_mode();
+	let (rate_limit_enabled, pps_limit, window_ms) = get_rate_limit_config();
 
 	// Parse Ethernet header - use offset_of! for efficiency (only validate the field we need)
 	let ether_type: *const EtherType = ptr_at(&ctx, mem::offset_of!(EthHdr, ether_type))?;
@@ -273,11 +285,11 @@ fn try_fractalize_ebpf(ctx: XdpContext) -> Result<u32, ()> {
 			let src_ip = u32::from_be_bytes(src_addr);
 
 			// Check IP filter
-			if !check_ip_allowed(src_ip, ip_filter_mode) {
+			if !check_ip_allowed(&IP_FILTER_LIST_V4, &src_ip, ip_filter_mode) {
 				if log_level >= LogLevel::DropsOnly {
 					info!(
 						&ctx,
-						"⛔ Blocked IP: {}.{}.{}.{}",
+						"⛔ Blocked IPv4: {}.{}.{}.{}",
 						src_addr[0],
 						src_addr[1],
 						src_addr[2],
@@ -288,28 +300,20 @@ fn try_fractalize_ebpf(ctx: XdpContext) -> Result<u32, ()> {
 			}
 
 			// Check rate limit
-			let rate_limit_enabled = match CONFIG.get(CONFIG_RATE_LIMIT_ENABLED) {
-				Some(enabled) => *enabled != 0,
-				None => false,
-			};
-
-			if rate_limit_enabled {
-				let pps_limit = CONFIG.get(CONFIG_RATE_LIMIT_PPS).copied().unwrap_or(1000);
-				let window_ms = CONFIG.get(CONFIG_RATE_LIMIT_WINDOW_MS).copied().unwrap_or(1000);
-
-				if !check_rate_limit(src_ip, pps_limit as u32, window_ms as u32) {
-					if log_level >= LogLevel::DropsOnly {
-						info!(
-							&ctx,
-							"⚠️  Rate limit exceeded: {}.{}.{}.{}",
-							src_addr[0],
-							src_addr[1],
-							src_addr[2],
-							src_addr[3]
-						);
-					}
-					return Ok(xdp_action::XDP_DROP);
+			if rate_limit_enabled &&
+				!check_rate_limit(&RATE_LIMIT_STATE_V4, &src_ip, pps_limit, window_ms)
+			{
+				if log_level >= LogLevel::DropsOnly {
+					info!(
+						&ctx,
+						"⚠️  Rate limit exceeded: {}.{}.{}.{}",
+						src_addr[0],
+						src_addr[1],
+						src_addr[2],
+						src_addr[3]
+					);
 				}
+				return Ok(xdp_action::XDP_DROP);
 			}
 
 			if log_level == LogLevel::All {
@@ -336,6 +340,55 @@ fn try_fractalize_ebpf(ctx: XdpContext) -> Result<u32, ()> {
 			let ipv6hdr: *const Ipv6Hdr = ptr_at(&ctx, EthHdr::LEN)?;
 			let src_addr = unsafe { (*ipv6hdr).src_addr };
 			let dst_addr = unsafe { (*ipv6hdr).dst_addr };
+
+			// Convert IPv6 source address to [u32; 4] for map lookup
+			// IPv6 is already in network byte order (big-endian)
+			let src_ip: [u32; 4] = [
+				u32::from_be_bytes([src_addr[0], src_addr[1], src_addr[2], src_addr[3]]),
+				u32::from_be_bytes([src_addr[4], src_addr[5], src_addr[6], src_addr[7]]),
+				u32::from_be_bytes([src_addr[8], src_addr[9], src_addr[10], src_addr[11]]),
+				u32::from_be_bytes([src_addr[12], src_addr[13], src_addr[14], src_addr[15]]),
+			];
+
+			// Check IP filter
+			if !check_ip_allowed(&IP_FILTER_LIST_V6, &src_ip, ip_filter_mode) {
+				if log_level >= LogLevel::DropsOnly {
+					info!(
+						&ctx,
+						"⛔ Blocked IPv6: {:x}{:x}:{:x}{:x}:{:x}{:x}:{:x}{:x}...",
+						src_addr[0],
+						src_addr[1],
+						src_addr[2],
+						src_addr[3],
+						src_addr[4],
+						src_addr[5],
+						src_addr[6],
+						src_addr[7]
+					);
+				}
+				return Ok(xdp_action::XDP_DROP);
+			}
+
+			// Check rate limit
+			if rate_limit_enabled &&
+				!check_rate_limit(&RATE_LIMIT_STATE_V6, &src_ip, pps_limit, window_ms)
+			{
+				if log_level >= LogLevel::DropsOnly {
+					info!(
+						&ctx,
+						"⚠️  Rate limit exceeded (IPv6): {:x}{:x}:{:x}{:x}:{:x}{:x}:{:x}{:x}...",
+						src_addr[0],
+						src_addr[1],
+						src_addr[2],
+						src_addr[3],
+						src_addr[4],
+						src_addr[5],
+						src_addr[6],
+						src_addr[7]
+					);
+				}
+				return Ok(xdp_action::XDP_DROP);
+			}
 
 			if log_level == LogLevel::All {
 				info!(
