@@ -241,6 +241,46 @@ fn check_port_rule(ctx: &XdpContext, src_port: u16, dst_port: u16) -> Option<u32
 	None
 }
 
+/// Macro to handle IP filtering and rate limiting for both IPv4 and IPv6
+/// Reduces code duplication between IPv4/IPv6 code paths
+macro_rules! check_ip_and_rate_limit {
+	(
+		$ctx:expr,
+		$filter_map:expr,
+		$rate_map:expr,
+		$src_ip:expr,
+		$filter_mode:expr,
+		$log_level:expr,
+		$rate_config:expr;
+		blocked_msg: $blocked_fmt:expr, $($blocked_args:expr),*;
+		rate_limit_msg: $rate_limit_fmt:expr, $($rate_limit_args:expr),*;
+		verbose_msg: $verbose_fmt:expr, $($verbose_args:expr),*
+	) => {{
+		let (rate_enabled, pps_limit, window_ms) = $rate_config;
+
+		// Check IP filter
+		if !check_ip_allowed($filter_map, &$src_ip, $filter_mode) {
+			if $log_level >= LogLevel::DropsOnly {
+				info!($ctx, $blocked_fmt, $($blocked_args),*);
+			}
+			return Ok(xdp_action::XDP_DROP);
+		}
+
+		// Check rate limit
+		if rate_enabled && !check_rate_limit($rate_map, &$src_ip, pps_limit, window_ms) {
+			if $log_level >= LogLevel::DropsOnly {
+				info!($ctx, $rate_limit_fmt, $($rate_limit_args),*);
+			}
+			return Ok(xdp_action::XDP_DROP);
+		}
+
+		// Verbose logging
+		if $log_level == LogLevel::All {
+			info!($ctx, $verbose_fmt, $($verbose_args),*);
+		}
+	}};
+}
+
 #[inline(always)]
 fn ptr_at<T>(ctx: &XdpContext, offset: usize) -> Result<*const T, ()> {
 	let start = ctx.data();
@@ -284,52 +324,23 @@ fn try_fractalize_ebpf(ctx: XdpContext) -> Result<u32, ()> {
 			// Convert source IP to u32 (already in network byte order)
 			let src_ip = u32::from_be_bytes(src_addr);
 
-			// Check IP filter
-			if !check_ip_allowed(&IP_FILTER_LIST_V4, &src_ip, ip_filter_mode) {
-				if log_level >= LogLevel::DropsOnly {
-					info!(
-						&ctx,
-						"⛔ Blocked IPv4: {}.{}.{}.{}",
-						src_addr[0],
-						src_addr[1],
-						src_addr[2],
-						src_addr[3]
-					);
-				}
-				return Ok(xdp_action::XDP_DROP);
-			}
-
-			// Check rate limit
-			if rate_limit_enabled &&
-				!check_rate_limit(&RATE_LIMIT_STATE_V4, &src_ip, pps_limit, window_ms)
-			{
-				if log_level >= LogLevel::DropsOnly {
-					info!(
-						&ctx,
-						"⚠️  Rate limit exceeded: {}.{}.{}.{}",
-						src_addr[0],
-						src_addr[1],
-						src_addr[2],
-						src_addr[3]
-					);
-				}
-				return Ok(xdp_action::XDP_DROP);
-			}
-
-			if log_level == LogLevel::All {
-				info!(
-					&ctx,
-					"IPv4: {}.{}.{}.{} → {}.{}.{}.{}",
-					src_addr[0],
-					src_addr[1],
-					src_addr[2],
-					src_addr[3],
-					dst_addr[0],
-					dst_addr[1],
-					dst_addr[2],
-					dst_addr[3]
-				);
-			}
+			// Check IP filtering and rate limiting
+			check_ip_and_rate_limit!(
+				&ctx,
+				&IP_FILTER_LIST_V4,
+				&RATE_LIMIT_STATE_V4,
+				src_ip,
+				ip_filter_mode,
+				log_level,
+				(rate_limit_enabled, pps_limit, window_ms);
+				blocked_msg: "⛔ Blocked IPv4: {}.{}.{}.{}",
+					src_addr[0], src_addr[1], src_addr[2], src_addr[3];
+				rate_limit_msg: "⚠️  Rate limit exceeded: {}.{}.{}.{}",
+					src_addr[0], src_addr[1], src_addr[2], src_addr[3];
+				verbose_msg: "IPv4: {}.{}.{}.{} → {}.{}.{}.{}",
+					src_addr[0], src_addr[1], src_addr[2], src_addr[3],
+					dst_addr[0], dst_addr[1], dst_addr[2], dst_addr[3]
+			);
 
 			let proto = unsafe { (*ipv4hdr).proto };
 			let ihl = unsafe { (*ipv4hdr).ihl() }; // Get header length (20-60 bytes)
@@ -350,68 +361,27 @@ fn try_fractalize_ebpf(ctx: XdpContext) -> Result<u32, ()> {
 				u32::from_be_bytes([src_addr[12], src_addr[13], src_addr[14], src_addr[15]]),
 			];
 
-			// Check IP filter
-			if !check_ip_allowed(&IP_FILTER_LIST_V6, &src_ip, ip_filter_mode) {
-				if log_level >= LogLevel::DropsOnly {
-					info!(
-						&ctx,
-						"⛔ Blocked IPv6: {:x}{:x}:{:x}{:x}:{:x}{:x}:{:x}{:x}...",
-						src_addr[0],
-						src_addr[1],
-						src_addr[2],
-						src_addr[3],
-						src_addr[4],
-						src_addr[5],
-						src_addr[6],
-						src_addr[7]
-					);
-				}
-				return Ok(xdp_action::XDP_DROP);
-			}
-
-			// Check rate limit
-			if rate_limit_enabled &&
-				!check_rate_limit(&RATE_LIMIT_STATE_V6, &src_ip, pps_limit, window_ms)
-			{
-				if log_level >= LogLevel::DropsOnly {
-					info!(
-						&ctx,
-						"⚠️  Rate limit exceeded (IPv6): {:x}{:x}:{:x}{:x}:{:x}{:x}:{:x}{:x}...",
-						src_addr[0],
-						src_addr[1],
-						src_addr[2],
-						src_addr[3],
-						src_addr[4],
-						src_addr[5],
-						src_addr[6],
-						src_addr[7]
-					);
-				}
-				return Ok(xdp_action::XDP_DROP);
-			}
-
-			if log_level == LogLevel::All {
-				info!(
-					&ctx,
-					"IPv6: {:x}{:x}:{:x}{:x}:{:x}{:x}:{:x}{:x}... → {:x}{:x}:{:x}{:x}:{:x}{:x}:{:x}{:x}...",
-					src_addr[0],
-					src_addr[1],
-					src_addr[2],
-					src_addr[3],
-					src_addr[4],
-					src_addr[5],
-					src_addr[6],
-					src_addr[7],
-					dst_addr[0],
-					dst_addr[1],
-					dst_addr[2],
-					dst_addr[3],
-					dst_addr[4],
-					dst_addr[5],
-					dst_addr[6],
-					dst_addr[7]
-				);
-			}
+			// Check IP filtering and rate limiting
+			check_ip_and_rate_limit!(
+				&ctx,
+				&IP_FILTER_LIST_V6,
+				&RATE_LIMIT_STATE_V6,
+				src_ip,
+				ip_filter_mode,
+				log_level,
+				(rate_limit_enabled, pps_limit, window_ms);
+				blocked_msg: "⛔ Blocked IPv6: {:x}{:x}:{:x}{:x}:{:x}{:x}:{:x}{:x}...",
+					src_addr[0], src_addr[1], src_addr[2], src_addr[3],
+					src_addr[4], src_addr[5], src_addr[6], src_addr[7];
+				rate_limit_msg: "⚠️  Rate limit exceeded (IPv6): {:x}{:x}:{:x}{:x}:{:x}{:x}:{:x}{:x}...",
+					src_addr[0], src_addr[1], src_addr[2], src_addr[3],
+					src_addr[4], src_addr[5], src_addr[6], src_addr[7];
+				verbose_msg: "IPv6: {:x}{:x}:{:x}{:x}:{:x}{:x}:{:x}{:x}... → {:x}{:x}:{:x}{:x}:{:x}{:x}:{:x}{:x}...",
+					src_addr[0], src_addr[1], src_addr[2], src_addr[3],
+					src_addr[4], src_addr[5], src_addr[6], src_addr[7],
+					dst_addr[0], dst_addr[1], dst_addr[2], dst_addr[3],
+					dst_addr[4], dst_addr[5], dst_addr[6], dst_addr[7]
+			);
 
 			let next_hdr = unsafe { (*ipv6hdr).next_hdr };
 			(next_hdr, EthHdr::LEN + Ipv6Hdr::LEN)
