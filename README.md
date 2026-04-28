@@ -48,6 +48,33 @@ xdp-fire show-stats
 
 ---
 
+## Project Structure
+
+Standard [Aya](https://github.com/aya-rs/aya) workspace — three crates, one build.
+
+```
+xdp-fire/
+├── xdp-fire-common/        # Shared types (kernel ↔ userspace)
+│   └── src/lib.rs           #   Action, LogLevel, IpFilterMode, RateLimitState
+│                            #   #![no_std] — must compile for both BPF and host targets
+│
+├── xdp-fire-ebpf/           # eBPF program (runs inside the Linux kernel)
+│   └── src/main.rs          #   Packet parsing, map lookups, XDP_PASS/XDP_DROP verdicts
+│                            #   #![no_std], #![no_main] — compiled to BPF bytecode
+│
+├── xdp-fire/                # Userspace binary (loads eBPF, CLI, map management)
+│   ├── build.rs             #   Invokes aya_build to compile the eBPF crate
+│   ├── src/main.rs          #   CLI (clap), map pinning, stats display, XDP attach
+│   └── tests/               #   Integration tests — load eBPF, poke maps from userspace
+│
+└── scripts/
+    └── benchmark.sh         # iperf3-based throughput comparison (baseline vs XDP)
+```
+
+**How they connect:** `cargo build` triggers `xdp-fire/build.rs`, which compiles `xdp-fire-ebpf` into BPF bytecode and embeds it into the final binary. At runtime, the userspace binary loads that bytecode into the kernel and communicates with it through eBPF maps pinned at `/sys/fs/bpf/xdp-fire/`.
+
+---
+
 ## Build
 
 ```bash
