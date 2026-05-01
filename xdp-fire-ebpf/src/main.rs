@@ -322,6 +322,9 @@ fn try_xdp_fire(ctx: XdpContext) -> Result<u32, ()> {
     let (rate_limit_enabled, pps_limit, window_ms) = get_rate_limit_config();
 
     // Parse Ethernet header - use offset_of! for efficiency (only validate the field we need)
+    // [dst MAC 6B][src MAC 6B][EtherType 2B][IP header...][TCP/UDP...]
+    //  ^                       ^
+    //  ctx.data()              ptr_at returns pointer here (offset 12)
     let ether_type: *const EtherType = ptr_at(&ctx, mem::offset_of!(EthHdr, ether_type))?;
 
     // Parse IP layer (IPv4 or IPv6) using EtherType enum
