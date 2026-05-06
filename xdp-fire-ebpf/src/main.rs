@@ -256,13 +256,13 @@ fn check_port_rule(ctx: &XdpContext, src_port: u16, dst_port: u16) -> Option<u32
 /// Reduces code duplication between IPv4/IPv6 code paths
 macro_rules! check_ip_and_rate_limit {
 	(
-		$ctx:expr,
-		$filter_map:expr,
-		$rate_map:expr,
-		$src_ip:expr,
-		$filter_mode:expr,
-		$log_level:expr,
-		$rate_config:expr;
+		$ctx:expr,         // XDP context (for logging)
+		$filter_map:expr,  // IP filter map (v4 or v6)
+		$rate_map:expr,    // rate limit state map (v4 or v6)
+		$src_ip:expr,      // source IP from the packet
+		$filter_mode:expr, // blocklist/allowlist/disabled
+		$log_level:expr,   // how verbose to log
+		$rate_config:expr; // (enabled, pps_limit, window_ms) tuple
 		blocked_msg: $blocked_fmt:expr, $($blocked_args:expr),*;
 		rate_limit_msg: $rate_limit_fmt:expr, $($rate_limit_args:expr),*;
 		verbose_msg: $verbose_fmt:expr, $($verbose_args:expr),*
