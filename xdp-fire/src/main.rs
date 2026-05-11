@@ -383,7 +383,7 @@ async fn handle_command(command: &Commands) -> anyhow::Result<()> {
                         .ok()
                         .map(|a| a.as_str())
                         .unwrap_or("UNKNOWN");
-                    println!("║    {:>5} -> {:<23}║", port, action_str);
+                    println!("║    {:>5} -> {:<25}║", port, action_str);
                     found_rules = true;
                 }
             }
