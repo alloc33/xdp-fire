@@ -491,6 +491,13 @@ async fn main() -> anyhow::Result<()> {
         debug!("remove limit on locked memory failed, ret is: {ret}");
     }
 
+    // Clean up stale pinned maps from a previous run (e.g. crash, killed process)
+    let map_pin_path = Path::new(MAP_PIN_PATH);
+    if map_pin_path.exists() {
+        warn!("Found stale maps at {}, cleaning up...", MAP_PIN_PATH);
+        std::fs::remove_dir_all(map_pin_path).ok();
+    }
+
     // This will include your eBPF object file as raw bytes at compile-time and load it at
     // runtime. This approach is recommended for most real-world use cases. If you would
     // like to specify the eBPF program at runtime rather than at compile-time, you can
@@ -527,8 +534,6 @@ async fn main() -> anyhow::Result<()> {
     // port_rules.insert(9933_u16, Action::LogOnly as u8, 0)?;  // Substrate RPC HTTP
 
     // Pin the maps so they can be accessed by runtime configuration commands
-    use std::path::Path;
-    let map_pin_path = Path::new(MAP_PIN_PATH);
     std::fs::create_dir_all(map_pin_path).ok(); // Create directory if it doesn't exist
     port_rules.pin(map_pin_path.join("PORT_RULES"))?;
 
