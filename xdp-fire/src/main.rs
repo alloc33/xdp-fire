@@ -151,6 +151,9 @@ enum Commands {
 
     /// Get rate limit configuration
     GetRateLimit,
+
+    /// Show full session status (config, rules, IPs, stats)
+    Status,
 }
 
 const MAP_PIN_PATH: &str = "/sys/fs/bpf/xdp-fire";
@@ -313,6 +316,110 @@ async fn handle_command(command: &Commands) -> anyhow::Result<()> {
                 }
             }
         }
+        Commands::Status => {
+            let config: Array<_, u32> = open_map("CONFIG")?;
+
+            // Log level
+            let log_level = config.get(&CONFIG_LOG_LEVEL, 0).unwrap_or(0);
+            let log_str = LogLevel::try_from(log_level as u8)
+                .ok()
+                .map(|l| l.as_str())
+                .unwrap_or("UNKNOWN");
+
+            // IP filter mode
+            let ip_mode = config.get(&CONFIG_IP_FILTER_MODE, 0).unwrap_or(0);
+            let ip_str = IpFilterMode::try_from(ip_mode as u8)
+                .ok()
+                .map(|m| m.as_str())
+                .unwrap_or("UNKNOWN");
+
+            // Rate limit
+            let rate_enabled = config.get(&CONFIG_RATE_LIMIT_ENABLED, 0).unwrap_or(0) != 0;
+            let rate_pps = config.get(&CONFIG_RATE_LIMIT_PPS, 0).unwrap_or(0);
+            let rate_window = config.get(&CONFIG_RATE_LIMIT_WINDOW_MS, 0).unwrap_or(0);
+
+            println!("╔══════════════════════════════════════╗");
+            println!("║          xdp-fire status             ║");
+            println!("╠══════════════════════════════════════╣");
+            println!("║  Log level:    {:<22}║", log_str);
+            println!("║  IP filter:    {:<22}║", ip_str);
+            if rate_enabled {
+                println!(
+                    "║  Rate limit:   {} pps / {} ms{}",
+                    rate_pps,
+                    rate_window,
+                    " ".repeat(
+                        22usize
+                            .saturating_sub(format!("{} pps / {} ms", rate_pps, rate_window).len())
+                    )
+                );
+            } else {
+                println!("║  Rate limit:   {:<22}║", "DISABLED");
+            }
+
+            // Global stats
+            let stats: Array<_, u64> = open_map("STATS")?;
+            let total = stats.get(&0, 0).unwrap_or(0);
+            let tcp = stats.get(&1, 0).unwrap_or(0);
+            let udp = stats.get(&2, 0).unwrap_or(0);
+            let substrate = stats.get(&3, 0).unwrap_or(0);
+            let non_ip = stats.get(&4, 0).unwrap_or(0);
+            println!("╠══════════════════════════════════════╣");
+            println!("║  Packets                             ║");
+            println!("║    Total:      {:<22}║", total);
+            println!("║    TCP:        {:<22}║", tcp);
+            println!("║    UDP:        {:<22}║", udp);
+            println!("║    Substrate:  {:<22}║", substrate);
+            println!("║    Non-IP:     {:<22}║", non_ip);
+
+            // Port rules
+            println!("╠══════════════════════════════════════╣");
+            println!("║  Port rules                          ║");
+            let port_rules: HashMap<_, u16, u8> = open_map("PORT_RULES")?;
+            let mut found_rules = false;
+            for item in port_rules.iter() {
+                if let Ok((port, action)) = item {
+                    let action_str = Action::try_from(action)
+                        .ok()
+                        .map(|a| a.as_str())
+                        .unwrap_or("UNKNOWN");
+                    println!("║    {:>5} → {:<24}║", port, action_str);
+                    found_rules = true;
+                }
+            }
+            if !found_rules {
+                println!("║    (none)                            ║");
+            }
+
+            // IP filter list
+            println!("╠══════════════════════════════════════╣");
+            println!("║  IP filter list                      ║");
+            let mut found_ips = false;
+            if let Ok(ipv4_list) = open_map::<HashMap<_, u32, u8>>("IP_FILTER_LIST_V4") {
+                for item in ipv4_list.iter() {
+                    if let Ok((ip_u32, _)) = item {
+                        println!("║    {:<34}║", format!("{} (v4)", Ipv4Addr::from(ip_u32)));
+                        found_ips = true;
+                    }
+                }
+            }
+            if let Ok(ipv6_list) = open_map::<HashMap<_, [u32; 4], u8>>("IP_FILTER_LIST_V6") {
+                for item in ipv6_list.iter() {
+                    if let Ok((ip_array, _)) = item {
+                        println!(
+                            "║    {:<34}║",
+                            format!("{} (v6)", u32_array_to_ipv6(&ip_array))
+                        );
+                        found_ips = true;
+                    }
+                }
+            }
+            if !found_ips {
+                println!("║    (empty)                           ║");
+            }
+
+            println!("╚══════════════════════════════════════╝");
+        }
         Commands::ShowStats { port } => {
             // Global packet counters
             let stats: Array<_, u64> = open_map("STATS")?;
@@ -321,7 +428,10 @@ async fn handle_command(command: &Commands) -> anyhow::Result<()> {
             let udp = stats.get(&2, 0).unwrap_or(0);
             let substrate = stats.get(&3, 0).unwrap_or(0);
             let non_ip = stats.get(&4, 0).unwrap_or(0);
-            info!("📊 Global: Total={} TCP={} UDP={} Substrate={} Non-IP={}", total, tcp, udp, substrate, non_ip);
+            info!(
+                "📊 Global: Total={} TCP={} UDP={} Substrate={} Non-IP={}",
+                total, tcp, udp, substrate, non_ip
+            );
 
             let port_stats: HashMap<_, u16, u64> = open_map("PORT_STATS")?;
             if let Some(specific_port) = port {
