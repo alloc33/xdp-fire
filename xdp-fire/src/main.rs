@@ -314,6 +314,15 @@ async fn handle_command(command: &Commands) -> anyhow::Result<()> {
             }
         }
         Commands::ShowStats { port } => {
+            // Global packet counters
+            let stats: Array<_, u64> = open_map("STATS")?;
+            let total = stats.get(&0, 0).unwrap_or(0);
+            let tcp = stats.get(&1, 0).unwrap_or(0);
+            let udp = stats.get(&2, 0).unwrap_or(0);
+            let substrate = stats.get(&3, 0).unwrap_or(0);
+            let non_ip = stats.get(&4, 0).unwrap_or(0);
+            info!("📊 Global: Total={} TCP={} UDP={} Substrate={} Non-IP={}", total, tcp, udp, substrate, non_ip);
+
             let port_stats: HashMap<_, u16, u64> = open_map("PORT_STATS")?;
             if let Some(specific_port) = port {
                 // Show stats for specific port
@@ -416,6 +425,10 @@ async fn main() -> anyhow::Result<()> {
     // Also pin PORT_STATS for statistics access
     let port_stats: HashMap<_, u16, u64> = ebpf.map_mut("PORT_STATS").unwrap().try_into()?;
     port_stats.pin(map_pin_path.join("PORT_STATS"))?;
+
+    // Pin STATS array for global packet counters
+    let stats: Array<_, u64> = ebpf.map_mut("STATS").unwrap().try_into()?;
+    stats.pin(map_pin_path.join("STATS"))?;
 
     // Pin CONFIG map for runtime log level, IP filter, and rate limit control
     let mut config: Array<_, u32> = ebpf.map_mut("CONFIG").unwrap().try_into()?;
