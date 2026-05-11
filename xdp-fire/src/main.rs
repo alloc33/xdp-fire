@@ -14,10 +14,7 @@ use std::{
     path::Path,
 };
 
-use tokio::{
-    signal,
-    time::{Duration, sleep},
-};
+use tokio::signal;
 
 /// Convert Ipv6Addr to [u32; 4] for eBPF map key (network byte order)
 #[inline]
@@ -495,29 +492,6 @@ async fn main() -> anyhow::Result<()> {
             );
         }
     }
-
-    // Get reference to statistics map
-    let stats_map: Array<_, u64> = ebpf.take_map("STATS").unwrap().try_into()?;
-
-    // Spawn background task to display statistics every second
-    tokio::task::spawn(async move {
-        loop {
-            sleep(Duration::from_secs(1)).await;
-
-            // Read statistics from eBPF map
-            let total = stats_map.get(&0, 0).unwrap_or(0);
-            let tcp = stats_map.get(&1, 0).unwrap_or(0);
-            let udp = stats_map.get(&2, 0).unwrap_or(0);
-            let substrate = stats_map.get(&3, 0).unwrap_or(0);
-            let non_ip = stats_map.get(&4, 0).unwrap_or(0);
-
-            // Display statistics
-            info!(
-                "📊 Stats: Total={} TCP={} UDP={} Substrate={} Non-IP={}",
-                total, tcp, udp, substrate, non_ip
-            );
-        }
-    });
 
     let ctrl_c = signal::ctrl_c();
     println!("Waiting for Ctrl-C...");
