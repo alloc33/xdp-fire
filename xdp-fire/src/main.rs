@@ -357,7 +357,7 @@ async fn handle_command(command: &Commands) -> anyhow::Result<()> {
 async fn main() -> anyhow::Result<()> {
     let opt = Opt::parse();
 
-    env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     // Handle configuration subcommands
     if let Some(command) = &opt.command {
@@ -523,6 +523,13 @@ async fn main() -> anyhow::Result<()> {
     println!("Waiting for Ctrl-C...");
     ctrl_c.await?;
     println!("Exiting...");
+
+    // Clean up pinned maps so next run doesn't fail with "File exists"
+    if let Err(e) = std::fs::remove_dir_all(MAP_PIN_PATH) {
+        warn!("Failed to clean up pinned maps at {}: {}", MAP_PIN_PATH, e);
+    } else {
+        info!("🧹 Cleaned up pinned maps at {}", MAP_PIN_PATH);
+    }
 
     Ok(())
 }
